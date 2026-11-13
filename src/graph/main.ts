@@ -31,6 +31,7 @@ const $ = <T extends Element>(id: string) => document.getElementById(id) as unkn
 const repoEl = $<HTMLElement>('repo')
 const branchEl = $<HTMLElement>('branch')
 const refreshEl = $<HTMLButtonElement>('refresh')
+const switchRepoEl = $<HTMLButtonElement>('switch-repo')
 const messageEl = $<HTMLElement>('message')
 const listEl = $<HTMLElement>('list')
 const graphEl = $<SVGSVGElement>('graph')
@@ -91,6 +92,18 @@ async function pin(path: string): Promise<void> {
   writePins(pins)
 }
 
+/** True when the shown repo came from a pick, so it can be picked again. */
+let pickedRepo = false
+
+/** Forgets this workspace's pick; the worker answers `ambiguous` again and the picker returns. */
+async function unpin(): Promise<void> {
+  const pins = readPins()
+  for (const id of await terminalIds()) delete pins[id]
+  writePins(pins)
+  sessionPick = null
+  await refresh()
+}
+
 // ---- Loading -------------------------------------------------------------------------------
 
 async function request(input: { limit: number; skip: number }): Promise<GraphLoad> {
@@ -132,6 +145,7 @@ async function loadMore(): Promise<void> {
 }
 
 async function apply(result: GraphLoad, append: boolean): Promise<void> {
+  pickedRepo = result.ok && result.resolvedBy.startsWith('pinned')
   if (!result.ok) {
     repo = null
     commits = []
@@ -270,6 +284,7 @@ function renderHeader(): void {
   repoEl.title = repo?.path ?? ''
   branchEl.hidden = !repo?.branch
   branchEl.textContent = repo?.branch ?? ''
+  switchRepoEl.hidden = !(repo && pickedRepo)
 }
 
 // ---- Motion --------------------------------------------------------------------------------
@@ -807,6 +822,8 @@ document.addEventListener('keydown', (event) => {
 
 listEl.addEventListener('scroll', maybeLoadMore, { passive: true })
 refreshEl.addEventListener('click', () => void refresh())
+switchRepoEl.append(icon(ICONS.switch))
+switchRepoEl.addEventListener('click', () => void unpin())
 
 orca.plugin.on('repo.changed', () => void refresh())
 // Fires when focus moves to another workspace (its first delivery on subscribe is not relied on).
