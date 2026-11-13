@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { parseDiffTree, parseStatus } from './git.ts'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { git, parseDiffTree, parseStatus, readWorktreeChanges } from './git.ts'
 
 const Z = '0000000000000000000000000000000000000000'
 const raw = (status: string) => `:100644 100644 ${Z} ${Z} ${status}`
@@ -50,4 +53,42 @@ test('status counts staged, unstaged, untracked and conflicted paths', () => {
   const detached = parseStatus(['# branch.oid abc', '# branch.head (detached)', ''].join('\0'))
   assert.equal(detached.branch, null)
   assert.equal(detached.upstream, null)
+})
+
+test('worktree changes list staged, unstaged and untracked files against HEAD', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'finline-wt-'))
+  try {
+    const run = (...args: string[]) => git(dir, args)
+    await run('init', '-q')
+    await run('config', 'user.email', 'test@example.com')
+    await run('config', 'user.name', 'Test')
+    await writeFile(join(dir, 'kept.txt'), 'a\nb\n')
+    await writeFile(join(dir, 'gone.txt'), 'x\n')
+    await writeFile(join(dir, '.gitignore'), 'ignored.txt\n')
+    await run('add', '.')
+    await run('commit', '-q', '-m', 'init')
+    await writeFile(join(dir, 'kept.txt'), 'a\nb\nc\n') // unstaged edit
+    await writeFile(join(dir, 'staged.txt'), 'one\n')
+    await run('add', 'staged.txt')
+    await rm(join(dir, 'gone.txt'))
+    await mkdir(join(dir, 'sub'))
+    await writeFile(join(dir, 'sub', 'new.txt'), '1\n2\n3') // untracked, no final newline
+    await writeFile(join(dir, 'ignored.txt'), 'nope\n')
+
+    const changes = await readWorktreeChanges(join(dir, 'sub'), 100) // from a subfolder too
+    const byPath = Object.fromEntries(changes.files.map((f) => [f.path, f]))
+    assert.deepEqual(Object.keys(byPath).sort(), ['gone.txt', 'kept.txt', 'staged.txt', 'sub/new.txt'])
+    assert.deepEqual(byPath['kept.txt'], { status: 'M', path: 'kept.txt', added: 1, deleted: 0 })
+    assert.deepEqual(byPath['staged.txt'], { status: 'A', path: 'staged.txt', added: 1, deleted: 0 })
+    assert.deepEqual(byPath['gone.txt'], { status: 'D', path: 'gone.txt', added: 0, deleted: 1 })
+    assert.deepEqual(byPath['sub/new.txt'], { status: 'A', path: 'sub/new.txt', added: 3, deleted: 0, untracked: true })
+    assert.match(changes.head, /^[0-9a-f]{40}$/)
+    assert.equal(changes.filesTruncated, false)
+
+    const capped = await readWorktreeChanges(dir, 2)
+    assert.equal(capped.files.length, 2)
+    assert.equal(capped.filesTruncated, true)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })

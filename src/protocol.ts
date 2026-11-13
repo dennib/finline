@@ -1,5 +1,5 @@
 // Panel <-> worker contract, shared by the panel and src/worker.ts.
-import type { ActionResult, DetailsLoad, GitAction, GraphLoad, StatusLoad } from './types'
+import type { ActionResult, DetailsLoad, GitAction, GraphLoad, StatusLoad, WorktreeLoad } from './types'
 
 declare module 'orca' {
   interface PluginRequests {
@@ -10,6 +10,8 @@ declare module 'orca' {
     'graph.load': { input: { limit?: number; skip?: number; preferredPath?: string }; output: GraphLoad }
     /** Full message, author/committer and changed files of one commit in a repo `graph.load` returned. */
     'commit.details': { input: { path: string; hash: string }; output: DetailsLoad }
+    /** Uncommitted changes (staged, unstaged, untracked) against HEAD, as a file list. */
+    'worktree.changes': { input: { path: string }; output: WorktreeLoad }
     /** Branch, upstream, ahead/behind, uncommitted changes and any stopped merge or rebase. */
     'repo.status': { input: { path: string }; output: StatusLoad }
     /** Runs one git action in the background, without prompts. */
@@ -20,5 +22,7 @@ declare module 'orca' {
   interface PluginPanelEvents {
     /** Posted when HEAD, refs or the index of the watched repo change. */
     'repo.changed': { path: string }
+    /** Posted when a file in the watched repo's working tree changes (outside the git dir). */
+    'worktree.changed': { path: string }
   }
 }

@@ -1,9 +1,9 @@
 // Thin wrapper over the system `git`, run with execFile (no shell) so paths with spaces and
 // Windows drive letters pass through untouched.
 import { execFile } from 'node:child_process'
-import { access } from 'node:fs/promises'
+import { access, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { Commit, CommitDetails, FileChange, FileStatus, Operation, Ref, RepoStatus } from './types'
+import type { Commit, CommitDetails, FileChange, FileStatus, Operation, Ref, RepoStatus, WorktreeChanges } from './types'
 
 const FIELD = '\x1f'
 const RECORD = '\x1e'
@@ -253,6 +253,53 @@ export async function readCommitDetails(
     comparedTo,
     files: files.slice(0, maxFiles),
     filesTruncated: files.length > maxFiles
+  }
+}
+
+// Untracked files have no numstat; count their lines here, up to this size.
+const MAX_COUNTED_BYTES = 1024 * 1024
+
+/** Lines in a new file, or null when it looks binary, is too big or can't be read. */
+async function countLines(path: string): Promise<number | null> {
+  try {
+    const { size } = await stat(path)
+    if (size > MAX_COUNTED_BYTES) return null
+    const data = await readFile(path)
+    if (data.includes(0)) return null
+    if (data.length === 0) return 0
+    let lines = 0
+    for (const byte of data) if (byte === 10) lines++
+    return data[data.length - 1] === 10 ? lines : lines + 1
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Everything not committed yet: staged and unstaged changes against HEAD in one diff (like
+ * `git diff HEAD`), then the untracked files that `.gitignore` doesn't exclude.
+ */
+export async function readWorktreeChanges(cwd: string, maxFiles: number, signal?: AbortSignal): Promise<WorktreeChanges> {
+  const [head, diff, others, top] = await Promise.all([
+    git(cwd, ['rev-parse', '--verify', 'HEAD'], signal),
+    git(cwd, ['diff', 'HEAD', '-z', '-M', '--raw', '--numstat'], signal),
+    git(cwd, ['ls-files', '--others', '--exclude-standard', '--full-name', '-z', '--', ':/'], signal),
+    git(cwd, ['rev-parse', '--show-toplevel'], signal)
+  ])
+  const files = parseDiffTree(diff)
+  const untracked = others.split('\0').filter(Boolean)
+  const room = Math.max(0, maxFiles - files.length)
+  const counted = await Promise.all(
+    untracked.slice(0, room).map(async (path): Promise<FileChange> => {
+      const added = await countLines(join(top.trim(), path))
+      return { status: 'A', path, added, deleted: added === null ? null : 0, untracked: true }
+    })
+  )
+  const all = files.concat(counted)
+  return {
+    head: head.trim(),
+    files: all.slice(0, maxFiles),
+    filesTruncated: files.length + untracked.length > maxFiles
   }
 }
 

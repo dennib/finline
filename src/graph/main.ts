@@ -12,7 +12,9 @@ import type {
   Ref,
   RepoInfo,
   RepoStatus,
-  StatusLoad
+  StatusLoad,
+  WorktreeChanges,
+  WorktreeLoad
 } from '../types.ts'
 import { commitMenu, createToolbar, initActions, refMenu, renderBanner } from './actions.ts'
 import { el, icon, ICONS, moving, svg } from './dom.ts'
@@ -41,7 +43,10 @@ const detailsEl = $<HTMLElement>('details')
 const bannerEl = $<HTMLElement>('banner')
 
 let repo: RepoInfo | null = null
+/** Commits loaded so far, in `git log` order; paging counts these. */
 let commits: Commit[] = []
+/** What the list shows: the uncommitted-changes row, when there is one, then `commits`. */
+let rows: Commit[] = []
 let hasMore = false
 let selected: string | null = null
 let seq = 0
@@ -165,6 +170,7 @@ async function apply(result: GraphLoad, append: boolean): Promise<void> {
   commits = append ? commits.concat(result.commits) : result.commits
   hasMore = result.hasMore
   if (switched) {
+    status = null // the other repo's: no uncommitted-changes row until this one's status arrives
     detailsCache.clear()
     select(null)
     listEl.scrollTop = 0
@@ -188,9 +194,35 @@ const toolbar = createToolbar()
 refreshEl.before(toolbar.node)
 
 function setStatus(next: RepoStatus | null): void {
+  const before = wipLabel()
   status = next
   toolbar.render(status)
   renderBanner(bannerEl, status)
+  if (wipLabel() !== before) renderList()
+  if (selected === WORKTREE && rowOf(WORKTREE)) void loadDetails(WORKTREE)
+}
+
+// ---- Uncommitted changes: a row above the commits, linked to HEAD ----------------------------
+
+/** The uncommitted-changes row's id; never a hex hash, so no git command ever gets it. */
+const WORKTREE = 'worktree'
+
+/** Files with uncommitted changes (staged, unstaged, untracked, conflicted); 0 when clean. */
+function wipCount(): number {
+  if (!status?.head) return 0
+  return status.staged + status.unstaged + status.untracked + status.conflicts
+}
+
+/** The row's subject, empty without a row; a change means the list has to be redrawn. */
+function wipLabel(): string {
+  const count = wipCount()
+  return count > 0 && commits.length > 0 ? `Uncommitted changes (${count})` : ''
+}
+
+function wipCommit(): Commit | null {
+  const label = wipLabel()
+  if (!label || !status?.head) return null
+  return { hash: WORKTREE, shortHash: '*', parents: [status.head], author: '', authoredAt: 0, subject: label, refs: [] }
 }
 
 /** Reads status for the shown repo; the newest answer wins. */
@@ -224,15 +256,18 @@ initActions({
  */
 function animateArrivals(shown: Set<string>): void {
   if (!moving()) return
-  const rows = [...rowsEl.querySelectorAll<HTMLElement>('.row')]
+  const nodes = [...rowsEl.querySelectorAll<HTMLElement>('.row')]
   if (shown.size === 0) {
-    rows.slice(0, 40).forEach((row, i) => {
+    nodes.slice(0, 40).forEach((row, i) => {
       row.style.animationDelay = `${i * 12}ms`
       row.classList.add('enter')
     })
     return
   }
-  for (const row of rows) if (!shown.has(row.dataset.hash ?? '')) row.classList.add('fresh')
+  for (const row of nodes) {
+    const hash = row.dataset.hash ?? ''
+    if (hash !== WORKTREE && !shown.has(hash)) row.classList.add('fresh')
+  }
 }
 
 function setLoading(on: boolean): void {
@@ -318,12 +353,18 @@ let nodeEls: SVGCircleElement[] = []
 let hotRow = -1
 
 function renderList(): void {
-  layout = layoutGraph(commits)
+  const wip = wipCommit()
+  rows = wip ? [wip, ...commits] : commits
+  layout = layoutGraph(rows)
   graphWidth = PAD_X * 2 + Math.max(1, layout.width) * COL_W
-  if (commits.length === 0) {
+  if (rows.length === 0) {
     rowsEl.replaceChildren(repo ? el('div', 'empty', 'No commits yet') : '')
   } else {
-    rowsEl.replaceChildren(...commits.map((commit, row) => renderRow(commit, graphWidth, layout.colors[row])))
+    rowsEl.replaceChildren(
+      ...rows.map((commit, row) =>
+        commit === wip ? renderWipRow(commit, graphWidth) : renderRow(commit, graphWidth, layout.colors[row])
+      )
+    )
   }
   placeDetails()
 }
@@ -335,17 +376,20 @@ function renderList(): void {
 function drawGraph(): void {
   // Follow where the details actually are, not the selection: they stay put while closing.
   const anchor = detailsEl.hidden ? undefined : (detailsEl.previousElementSibling as HTMLElement | null)?.dataset.hash
-  const open = anchor ? commits.findIndex((c) => c.hash === anchor) : -1
+  const open = anchor ? rows.findIndex((c) => c.hash === anchor) : -1
   const extra = open >= 0 ? detailsEl.offsetHeight : 0
   const x = (col: number) => PAD_X + col * COL_W + COL_W / 2
   const y = (row: number) => row * ROW_H + ROW_H / 2 + (open >= 0 && row > open ? extra : 0)
 
   graphEl.setAttribute('width', String(graphWidth))
-  graphEl.setAttribute('height', String(commits.length * ROW_H + extra + (hasMore ? ROW_H : 0)))
-  const paths = layout.edges.map((edge) =>
-    svg('path', { d: edgePath(edge, x, y, ROW_H), stroke: laneColor(edge.color) })
-  )
-  nodeEls = commits.map((commit, row) => {
+  graphEl.setAttribute('height', String(rows.length * ROW_H + extra + (hasMore ? ROW_H : 0)))
+  const wip = rows[0]?.hash === WORKTREE
+  const paths = layout.edges.map((edge) => {
+    const path = svg('path', { d: edgePath(edge, x, y, ROW_H), stroke: laneColor(edge.color) })
+    if (wip && edge.fromRow === 0) path.classList.add('wip')
+    return path
+  })
+  nodeEls = rows.map((commit, row) => {
     const isHead = commit.refs.some((r) => r.kind === 'head' || r.kind === 'detached')
     const node = svg('circle', {
       cx: x(layout.cols[row]),
@@ -355,6 +399,7 @@ function drawGraph(): void {
       stroke: laneColor(layout.colors[row])
     })
     node.classList.toggle('head', isHead)
+    node.classList.toggle('wip', commit.hash === WORKTREE)
     node.classList.toggle('hot', row === hotRow)
     node.classList.toggle('picked', commit.hash === selected)
     return node
@@ -385,6 +430,23 @@ function renderRow(commit: Commit, indent: number, color: number): HTMLElement {
     el('span', 'date', shortAge(commit.authoredAt)),
     el('span', 'hash', commit.shortHash)
   )
+  return row
+}
+
+/** The uncommitted-changes row: no author, date or hash, just what changed. */
+function renderWipRow(commit: Commit, indent: number): HTMLElement {
+  const row = el('div', 'row wip')
+  row.style.paddingLeft = `${indent}px`
+  row.dataset.hash = commit.hash
+  row.setAttribute('role', 'option')
+  row.setAttribute('aria-selected', String(commit.hash === selected))
+  const parts: string[] = []
+  if (status?.staged) parts.push(`${status.staged} staged`)
+  if (status?.unstaged) parts.push(`${status.unstaged} unstaged`)
+  if (status?.untracked) parts.push(`${status.untracked} untracked`)
+  if (status?.conflicts) parts.push(`${status.conflicts} conflicted`)
+  row.title = `${commit.subject}\n${parts.join(', ')}`
+  row.append(el('span', 'subject', commit.subject), el('span', 'author', parts.join(' · ')))
   return row
 }
 
@@ -440,7 +502,7 @@ function select(hash: string | null): void {
   for (const row of rowsEl.querySelectorAll<HTMLElement>('.row')) {
     row.setAttribute('aria-selected', String(row.dataset.hash === hash))
   }
-  nodeEls.forEach((node, i) => node.classList.toggle('picked', commits[i]?.hash === hash))
+  nodeEls.forEach((node, i) => node.classList.toggle('picked', rows[i]?.hash === hash))
   if (!changed) return
   placeDetails()
   void loadDetails(selected)
@@ -524,6 +586,7 @@ let detailsSeq = 0
 async function loadDetails(hash: string | null): Promise<void> {
   const mine = ++detailsSeq
   if (!hash || !repo) return
+  if (hash === WORKTREE) return loadWorktree(mine, repo.path)
   const cached = detailsCache.get(hash)
   if (cached) {
     renderDetails(cached)
@@ -551,8 +614,48 @@ async function loadDetails(hash: string | null): Promise<void> {
   }
 }
 
-/** Top-right of the details: the commit's actions (⋯) and close. */
-function detailsControls(): HTMLElement {
+/** Uncommitted changes move with every save: never cached, re-read on each status change. */
+async function loadWorktree(mine: number, path: string): Promise<void> {
+  const slow = setTimeout(() => {
+    if (mine === detailsSeq && detailsEl.childElementCount === 0) renderDetailsMessage('pending', 'Loading…')
+  }, 150)
+  try {
+    const result: WorktreeLoad = await orca.plugin.request('worktree.changes', { path })
+    clearTimeout(slow)
+    if (mine !== detailsSeq || selected !== WORKTREE) return
+    if (result.ok) renderWorktree(result.changes)
+    else renderDetailsMessage('error', result.message)
+  } catch (error) {
+    clearTimeout(slow)
+    if (mine !== detailsSeq) return
+    const e = error as { code?: string; message?: string }
+    renderDetailsMessage('error', `${e.code ?? 'error'}: ${e.message ?? String(error)}`)
+  }
+}
+
+function renderWorktree(changes: WorktreeChanges): void {
+  const info = el('div', 'details-info')
+  const meta = el('dl', 'details-meta')
+  const field = (label: string, value: Node) => {
+    const dd = el('dd', '')
+    dd.append(value)
+    meta.append(el('dt', '', `${label}:`), dd)
+  }
+  field('Compared to', parentLink(changes.head))
+  if (status) {
+    field('Staged', el('span', '', String(status.staged)))
+    field('Unstaged', el('span', '', String(status.unstaged)))
+    field('Untracked', el('span', '', String(status.untracked)))
+    if (status.conflicts > 0) field('Conflicts', el('span', '', String(status.conflicts)))
+  }
+  info.append(meta)
+  const grid = el('div', 'details-grid')
+  grid.append(info, renderFiles(changes.files, changes.filesTruncated))
+  morphDetails(() => detailsEl.replaceChildren(detailsControls(false), grid))
+}
+
+/** Top-right of the details: the commit's actions (⋯, not for uncommitted changes) and close. */
+function detailsControls(withMenu = true): HTMLElement {
   const controls = el('div', 'details-controls')
   const more = el('button', 'icon details-more')
   more.type = 'button'
@@ -570,7 +673,7 @@ function detailsControls(): HTMLElement {
     select(null)
     listEl.focus()
   })
-  controls.append(more, close)
+  controls.append(...(withMenu ? [more, close] : [close]))
   return controls
 }
 
@@ -596,7 +699,8 @@ function renderDetails(d: CommitDetails): void {
   info.append(meta, el('pre', 'details-message', d.message))
 
   const grid = el('div', 'details-grid')
-  grid.append(info, renderFiles(d))
+  const mergeBase = d.parents.length > 1 && d.comparedTo ? d.comparedTo : undefined
+  grid.append(info, renderFiles(d.files, d.filesTruncated, mergeBase))
   morphDetails(() => detailsEl.replaceChildren(detailsControls(), grid))
 }
 
@@ -610,7 +714,7 @@ const fullDate = (at: number) => new Date(at).toString()
 function parentLink(hash: string): HTMLElement {
   const link = el('button', 'parent mono', hash)
   link.type = 'button'
-  link.title = commits.some((c) => c.hash === hash) ? 'Show this commit' : 'Not loaded yet: scroll down to load it'
+  link.title = rows.some((c) => c.hash === hash) ? 'Show this commit' : 'Not loaded yet: scroll down to load it'
   link.addEventListener('click', () => reveal(hash, true))
   return link
 }
@@ -701,8 +805,9 @@ function renderFolderContents(folder: Folder): HTMLElement {
 }
 
 function renderFile(file: FileChange): HTMLElement {
-  const item = el('li', `tree-row file s-${file.status}`)
-  item.title = `${STATUS_NAMES[file.status]}: ${file.from ? `${file.from} → ${file.path}` : file.path}`
+  const item = el('li', `tree-row file s-${file.status}${file.untracked ? ' untracked' : ''}`)
+  const what = file.untracked ? 'Untracked' : STATUS_NAMES[file.status]
+  item.title = `${what}: ${file.from ? `${file.from} → ${file.path}` : file.path}`
   item.append(treeIcon('file'), el('span', 'name', baseName(file.path)))
   if (file.from) item.append(el('span', 'from', `← ${file.from}`))
   if (file.added !== null) {
@@ -727,25 +832,26 @@ function treeIcon(kind: 'folder' | 'file'): SVGSVGElement {
   return node
 }
 
-function renderFiles(d: CommitDetails): HTMLElement {
+/** `mergeBase` labels a merge's list with the first parent it is compared with. */
+function renderFiles(files: FileChange[], truncated: boolean, mergeBase?: string): HTMLElement {
   const section = el('div', 'details-files')
-  const added = d.files.reduce((sum, f) => sum + (f.added ?? 0), 0)
-  const deleted = d.files.reduce((sum, f) => sum + (f.deleted ?? 0), 0)
+  const added = files.reduce((sum, f) => sum + (f.added ?? 0), 0)
+  const deleted = files.reduce((sum, f) => sum + (f.deleted ?? 0), 0)
   const head = el('div', 'files-head')
-  const count = `${d.files.length}${d.filesTruncated ? '+' : ''} ${d.files.length === 1 ? 'file' : 'files'}`
+  const count = `${files.length}${truncated ? '+' : ''} ${files.length === 1 ? 'file' : 'files'}`
   head.append(el('span', '', count), el('span', 'plus', `+${added}`), el('span', 'minus', `-${deleted}`))
-  if (d.parents.length > 1 && d.comparedTo) {
-    const against = el('span', 'against', `vs ${d.comparedTo.slice(0, 7)}`)
+  if (mergeBase) {
+    const against = el('span', 'against', `vs ${mergeBase.slice(0, 7)}`)
     against.title = 'A merge is compared with its first parent'
     head.append(against)
   }
   section.append(head)
-  if (d.files.length === 0) {
+  if (files.length === 0) {
     section.append(el('p', 'pending', 'No file changes.'))
     return section
   }
-  section.append(renderFolderContents(buildTree(d.files)))
-  if (d.filesTruncated) section.append(el('p', 'pending', `Only the first ${d.files.length} files are listed.`))
+  section.append(renderFolderContents(buildTree(files)))
+  if (truncated) section.append(el('p', 'pending', `Only the first ${files.length} files are listed.`))
   return section
 }
 
@@ -799,17 +905,17 @@ listEl.addEventListener('keydown', (event) => {
 
 rowsEl.addEventListener('mouseover', (event) => {
   const row = (event.target as Element).closest<HTMLElement>('.row')
-  setHotRow(row ? commits.findIndex((c) => c.hash === row.dataset.hash) : -1)
+  setHotRow(row ? rows.findIndex((c) => c.hash === row.dataset.hash) : -1)
 })
 rowsEl.addEventListener('mouseleave', () => setHotRow(-1))
 
 listEl.addEventListener('keydown', (event) => {
   if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
   event.preventDefault()
-  const index = commits.findIndex((c) => c.hash === selected)
-  const next = Math.min(commits.length - 1, Math.max(0, index + (event.key === 'ArrowDown' ? 1 : -1)))
-  if (!commits[next]) return
-  reveal(commits[next].hash)
+  const index = rows.findIndex((c) => c.hash === selected)
+  const next = Math.min(rows.length - 1, Math.max(0, index + (event.key === 'ArrowDown' ? 1 : -1)))
+  if (!rows[next]) return
+  reveal(rows[next].hash)
 })
 
 document.addEventListener('keydown', (event) => {
@@ -826,6 +932,10 @@ switchRepoEl.append(icon(ICONS.switch))
 switchRepoEl.addEventListener('click', () => void unpin())
 
 orca.plugin.on('repo.changed', () => void refresh())
+// A file was saved or deleted: only the uncommitted-changes row (and its open details) moves.
+orca.plugin.on('worktree.changed', (payload: { path: string }) => {
+  if (payload.path === repo?.path) void loadStatus()
+})
 // Fires when focus moves to another workspace (its first delivery on subscribe is not relied on).
 orca.on('workspace.changed', () => {
   sessionPick = null
