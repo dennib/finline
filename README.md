@@ -66,7 +66,9 @@ remotes through git, with your git credentials.
 - Orca does not yet tell plugins the focused workspace's folder, so Finline matches it by name and
   branch. When two workspaces share both (for example two worktrees on `develop`), Finline asks you
   once which repository it is.
-- Workspaces on remote (SSH) hosts are not supported yet.
+- Workspaces on remote (SSH) hosts are experimental and work on macOS only. Finline runs git there
+  over `ssh` with your SSH config and keys, and checks for changes every 3 seconds, so a fetch or a
+  new tag shows up on the next refresh rather than right away.
 
 ## Development
 

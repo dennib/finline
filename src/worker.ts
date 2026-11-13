@@ -1,12 +1,25 @@
-// Finline's worker: finds the focused workspace's repository, reads it with the system `git`,
-// runs the git actions the panel asks for, and watches the git dir so open panels refresh.
+// Finline's worker: finds the focused workspace's repository (local or remote via SSH),
+// reads it with git, runs the git actions the panel asks for, and watches/polls the repo so open panels refresh.
 import { watch, type FSWatcher } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { AUTH_FAILURE, buildArgs, CONFLICT, isRemoteAction } from './actions'
-import { currentBranch, gitDirs, gitVersion, readCommitDetails, readCommits, readStatus, remoteNames, runGit } from './git'
+import {
+  currentBranch,
+  getRepoHost,
+  git,
+  gitDirs,
+  gitVersion,
+  readCommitDetails,
+  readCommits,
+  readStatus,
+  registerRepoHost,
+  remoteNames,
+  runGit
+} from './git'
+import { getSshTargetMap, resolveRemoteWorkspace, selectRemoteWorkspace } from './remote'
 import type { ActionResult, Candidate, DetailsLoad, GraphLoad, StatusLoad } from './types'
 
 const DEFAULT_LIMIT = 200
@@ -25,7 +38,7 @@ const REMOTE_TIMEOUT_MS = 120_000
 const LOCAL_TIMEOUT_MS = 60_000
 
 type Resolved =
-  | { ok: true; path: string; resolvedBy: string }
+  | { ok: true; path: string; resolvedBy: string; workspaceId?: string }
   | Exclude<GraphLoad, { ok: true } | { reason: 'git-failed' }>
 
 const isLocal = (hostId: string | null) => hostId === null || hostId === 'local'
@@ -45,9 +58,15 @@ async function devOverride(): Promise<string | null> {
   }
 }
 
+// Stores workspace ID for a resolved path so git.terminal can open a terminal even for remote worktrees
+const workspaceIdByPath = new Map<string, string>()
+
 async function resolveRepo(orca: OrcaWorkerApi, preferredPath?: string): Promise<Resolved> {
   const override = await devOverride()
-  if (override) return { ok: true, path: override, resolvedBy: 'dev override (.orca/dev-repo.txt)' }
+  if (override) {
+    registerRepoHost(override, null)
+    return { ok: true, path: override, resolvedBy: 'dev override (.orca/dev-repo.txt)' }
+  }
 
   const context = await orca.host.call('workspace.readContext', {})
   if (!context) return { ok: false, reason: 'no-workspace', message: 'No workspace is focused.' }
@@ -57,40 +76,127 @@ async function resolveRepo(orca: OrcaWorkerApi, preferredPath?: string): Promise
   const matches = workspaces.filter(
     (w) => w.name === context.displayName && (w.branch ?? null) === (context.branch || null)
   )
+
   const local = matches.filter((w) => isLocal(w.hostId))
-
-  if (local.length === 0) {
-    return matches.length > 0
-      ? { ok: false, reason: 'remote', message: `"${context.displayName}" is on a remote host, not supported yet.` }
-      : { ok: false, reason: 'not-found', message: `No local workspace "${context.displayName}" on ${context.branch}.` }
+  if (local.length === 1) {
+    registerRepoHost(local[0].path, null)
+    workspaceIdByPath.set(local[0].path, local[0].id)
+    return { ok: true, path: local[0].path, resolvedBy: 'name+branch (local)', workspaceId: local[0].id }
   }
-  if (local.length === 1) return { ok: true, path: local[0].path, resolvedBy: 'name+branch' }
 
-  const pinned = preferredPath ? local.find((w) => samePath(w.path, preferredPath)) : undefined
-  if (pinned) return { ok: true, path: pinned.path, resolvedBy: `pinned (1 of ${local.length})` }
+  if (local.length > 1) {
+    const pinned = preferredPath ? local.find((w) => samePath(w.path, preferredPath)) : undefined
+    if (pinned) {
+      registerRepoHost(pinned.path, null)
+      workspaceIdByPath.set(pinned.path, pinned.id)
+      return { ok: true, path: pinned.path, resolvedBy: `pinned (1 of ${local.length})`, workspaceId: pinned.id }
+    }
+    const candidates: Candidate[] = local.map((w) => ({ path: w.path, name: basename(w.path), branch: w.branch }))
+    return {
+      ok: false,
+      reason: 'ambiguous',
+      message: `${local.length} workspaces are named "${context.displayName}" on ${context.branch}.`,
+      candidates
+    }
+  }
 
-  const candidates: Candidate[] = local.map((w) => ({ path: w.path, name: basename(w.path), branch: w.branch }))
+  // If remote workspaces were reported directly by workspace.list
+  const remoteMatches = matches.filter((w) => !isLocal(w.hostId))
+  if (remoteMatches.length > 0) {
+    const targetMap = await getSshTargetMap()
+    // Only hosts we can map to an SSH alias: a raw hostId may not be one, and git would run elsewhere.
+    const resolvable = remoteMatches.flatMap((w) => {
+      const sshHost = w.hostId ? targetMap.get(w.hostId) : undefined
+      return sshHost ? [{ path: w.path, sshHost, workspaceId: w.id, branch: w.branch ?? undefined, name: basename(w.path) }] : []
+    })
+    if (resolvable.length === 0) {
+      return {
+        ok: false,
+        reason: 'not-found',
+        message: `"${context.displayName}" is on a remote host whose SSH alias Finline can't find.`
+      }
+    }
+    // Same picker and pinning as local repos when several remote workspaces match.
+    const picked = selectRemoteWorkspace(resolvable, context, preferredPath)
+    if (!picked.ok) return picked
+    registerRepoHost(picked.path, picked.sshHost)
+    if (picked.workspaceId) workspaceIdByPath.set(picked.path, picked.workspaceId)
+    return { ok: true, path: picked.path, resolvedBy: picked.resolvedBy, workspaceId: picked.workspaceId }
+  }
+
+  // Fallback: If workspace.list is empty or only local, resolve via remote environment discovery
+  const remoteResolved = await resolveRemoteWorkspace(context, preferredPath)
+  if (remoteResolved.ok) {
+    registerRepoHost(remoteResolved.path, remoteResolved.sshHost)
+    if (remoteResolved.workspaceId) {
+      workspaceIdByPath.set(remoteResolved.path, remoteResolved.workspaceId)
+    }
+    return {
+      ok: true,
+      path: remoteResolved.path,
+      resolvedBy: remoteResolved.resolvedBy,
+      workspaceId: remoteResolved.workspaceId
+    }
+  }
+
+  if (remoteResolved.reason === 'ambiguous') {
+    return remoteResolved
+  }
+
   return {
     ok: false,
-    reason: 'ambiguous',
-    message: `${local.length} workspaces are named "${context.displayName}" on ${context.branch}.`,
-    candidates
+    reason: 'not-found',
+    message: `No workspace "${context.displayName}" on ${context.branch}.`
   }
 }
 
 let watcher: FSWatcher | null = null
+let pollInterval: ReturnType<typeof setInterval> | null = null
 
 export default function activate(orca: OrcaWorkerApi): void {
   let watchedPath: string | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
+  let lastHeadHash: string | null = null
+
   // Repos graph.load has resolved: commit.details runs git only in one of these.
   const served = new Set<string>()
 
   async function watchRepo(path: string): Promise<boolean> {
-    if (watchedPath === path && watcher) return true
+    // A failed local watch leaves watcher null, so the next load retries it.
+    if (watchedPath === path && (watcher || pollInterval)) return true
     watcher?.close()
     watcher = null
+    if (pollInterval) {
+      clearInterval(pollInterval)
+      pollInterval = null
+    }
     watchedPath = path
+
+    const sshHost = getRepoHost(path)
+    if (sshHost) {
+      // Remote repository: poll git rev-parse HEAD every 3 seconds for ref changes
+      try {
+        lastHeadHash = (await git(path, ['rev-parse', 'HEAD'])).trim()
+      } catch {
+        lastHeadHash = null
+      }
+      pollInterval = setInterval(async () => {
+        if (watchedPath !== path) return
+        try {
+          const currentHead = (await git(path, ['rev-parse', 'HEAD'])).trim()
+          if (lastHeadHash && currentHead !== lastHeadHash) {
+            lastHeadHash = currentHead
+            orca.log(`remote repo changed (${path}), notifying panels`)
+            orca.panels.post('repo.changed', { path })
+          }
+        } catch {
+          // Ignore transient errors
+        }
+      }, 3000)
+      orca.log(`watching remote repo ${sshHost}:${path} (poll 3s)`)
+      return true
+    }
+
     try {
       const { commonDir } = await gitDirs(path)
       // The common dir holds refs and, under worktrees/<name>, each worktree's HEAD and index.
@@ -120,7 +226,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     try {
       const remotes = await remoteNames(resolved.path)
       const [version, branch, page] = await Promise.all([
-        gitVersion(),
+        gitVersion(resolved.path),
         currentBranch(resolved.path),
         // One extra tells us whether another page exists.
         readCommits(resolved.path, { skip: from, limit: max + 1, remotes }, signal)
@@ -186,12 +292,13 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (!built.ok) return { ok: false, message: built.message }
     const { workspaces } = await orca.host.call('workspace.list', {})
     const workspace = workspaces.find((w) => samePath(w.path, path))
-    if (!workspace) return { ok: false, message: 'No Orca workspace has this repository open.' }
+    const workspaceId = workspace?.id || workspaceIdByPath.get(path)
+    if (!workspaceId) return { ok: false, message: 'No Orca workspace has this repository open.' }
     // Every argument passed buildArgs' checks (names from a safe character set), so plain
     // quoting is enough for any shell the terminal runs.
     const quote = (arg: string) => (/^[\w.\/@:+=-]+$/.test(arg) ? arg : `"${arg}"`)
     const command = ['git', ...built.args].map(quote).join(' ')
-    await orca.host.call('terminal.create', { workspaceId: workspace.id, title: `Finline: git ${built.args[0]}`, command })
+    await orca.host.call('terminal.create', { workspaceId, title: `Finline: git ${built.args[0]}`, command })
     return { ok: true }
   })
 
@@ -209,4 +316,8 @@ export default function activate(orca: OrcaWorkerApi): void {
 export function deactivate(): void {
   watcher?.close()
   watcher = null
+  if (pollInterval) {
+    clearInterval(pollInterval)
+    pollInterval = null
+  }
 }
