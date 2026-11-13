@@ -41,18 +41,18 @@
   ],
   "cover": {
     "path": "assets/cover.png",
-    "alt": "Finline: a git graph for Orca, beside the panel showing a repository with branches, merges and tags"
+    "alt": "Finline: a git graph for Orca, beside the panel showing a repository with branches, merges, tags and uncommitted changes"
   },
   "screenshots": [
     {
       "path": "assets/screenshot-graph.png",
-      "alt": "The Finline panel showing colored lanes for main, feature branches, a hotfix and their merges, with branch, remote and tag badges",
-      "caption": "Every branch at a glance"
+      "alt": "The Finline panel with colored lanes, branch, remote and tag badges, and an expanded uncommitted changes row listing the changed files",
+      "caption": "Every branch, and what's not committed yet"
     },
     {
       "path": "assets/screenshot-sidebar.png",
-      "alt": "The Finline panel at sidebar width, showing the graph, refs, commit subjects and ages",
-      "caption": "Made for the sidebar"
+      "alt": "The Finline panel with the right-click menu of a branch badge open: check out, merge, rebase, push, rename, delete and copy name",
+      "caption": "Git actions a right-click away"
     }
   ]
 }

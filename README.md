@@ -11,9 +11,9 @@
 
 <p align="center"><em>fin</em> (an orca's fin) + <em>line</em> (the lanes of the graph).</p>
 
-![The Finline panel showing colored lanes for main, feature branches, a hotfix and their merges, with branch, remote and tag badges](assets/screenshot-graph.png)
+![The Finline panel with colored lanes, branch, remote and tag badges, and an expanded uncommitted changes row listing the changed files](assets/screenshot-graph.png)
 
-![The Finline panel at sidebar width, showing the graph, refs, commit subjects and ages](assets/screenshot-sidebar.png)
+![The Finline panel with the right-click menu of a branch badge open: check out, merge, rebase, push, rename, delete and copy name](assets/screenshot-sidebar.png)
 
 ## Features
 
