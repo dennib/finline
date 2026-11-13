@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "finline",
   "name": "Finline",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Git graph for the active worktree: branches, tags and remotes in colored lanes, commit details, and git actions from a right-click.",
   "author": {
     "name": "Denni Bevilacqua",
