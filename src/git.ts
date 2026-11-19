@@ -1,8 +1,10 @@
 // Thin wrapper over the system `git`, run with execFile (no shell) so paths with spaces and
-// Windows drive letters pass through untouched.
+// Windows drive letters pass through untouched. Repositories inside WSL run git in their
+// distribution through `wsl.exe` (see `./wsl`).
 import { execFile } from 'node:child_process'
 import { access, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
+import { hostPath, WSL_EXE, withWslEnv, wslGitArgs, wslTarget } from './wsl.ts'
 import type { Commit, CommitDetails, FileChange, FileStatus, Operation, Ref, RepoStatus, WorktreeChanges } from './types'
 
 const FIELD = '\x1f'
@@ -10,11 +12,19 @@ const RECORD = '\x1e'
 // hash, short hash, parents, author, author time (unix s), decorations, subject
 const FORMAT = ['%H', '%h', '%P', '%an', '%at', '%D', '%s'].join('%x1f') + '%x1e'
 
-export function git(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
+/** The program and arguments that run git with `args` in `cwd`'s repository. */
+async function gitCommand(cwd: string, args: string[]): Promise<[string, string[]]> {
+  const base = ['-c', 'core.quotepath=off', '-c', 'color.ui=false', ...args]
+  const target = await wslTarget(cwd)
+  return target ? [WSL_EXE, wslGitArgs(target, base)] : ['git', ['-C', cwd, ...base]]
+}
+
+export async function git(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
+  const [file, argv] = await gitCommand(cwd, args)
   return new Promise((resolve, reject) => {
     execFile(
-      'git',
-      ['-C', cwd, '-c', 'core.quotepath=off', '-c', 'color.ui=false', ...args],
+      file,
+      argv,
       { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, windowsHide: true, signal },
       (error, stdout, stderr) => {
         if (error) reject(new Error((stderr || error.message).trim()))
@@ -35,12 +45,13 @@ export interface RunResult {
  * Runs git for an action: never throws for a non-zero exit, keeps stderr (where push, pull and
  * merge report), and stops after `timeoutMs`. Prompts are off, so nothing waits on a person.
  */
-export function runGit(
+export async function runGit(
   cwd: string,
   args: string[],
   opts: { timeoutMs: number; signal?: AbortSignal }
 ): Promise<RunResult> {
-  const env = {
+  const [file, argv] = await gitCommand(cwd, args)
+  const vars = {
     ...process.env,
     GIT_TERMINAL_PROMPT: '0', // fail instead of asking for a username or password
     GIT_EDITOR: 'true', // accept prepared messages (merge, revert, rebase --continue)
@@ -48,10 +59,12 @@ export function runGit(
     GIT_MERGE_AUTOEDIT: 'no',
     GCM_INTERACTIVE: 'auto' // Git Credential Manager may still show its own sign-in window
   }
+  // wsl.exe hands only the variables listed in WSLENV on to git in the distribution.
+  const env = file === WSL_EXE ? withWslEnv(vars, Object.keys(vars)) : vars
   return new Promise((resolve) => {
     const child = execFile(
-      'git',
-      ['-C', cwd, '-c', 'core.quotepath=off', '-c', 'color.ui=false', ...args],
+      file,
+      argv,
       { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, windowsHide: true, timeout: opts.timeoutMs, signal: opts.signal, env },
       (error, stdout, stderr) => {
         const failure = error as (NodeJS.ErrnoException & { code?: number | string; killed?: boolean }) | null
@@ -130,8 +143,9 @@ async function operationInProgress(gitDir: string): Promise<Operation | null> {
   return null
 }
 
-export async function gitVersion(): Promise<string> {
-  return (await git('.', ['--version'])).trim()
+/** The version of the git that runs in `cwd` (inside WSL for a repository there). */
+export async function gitVersion(cwd = '.'): Promise<string> {
+  return (await git(cwd, ['--version'])).trim()
 }
 
 export async function remoteNames(cwd: string): Promise<string[]> {
@@ -287,11 +301,12 @@ export async function readWorktreeChanges(cwd: string, maxFiles: number, signal?
     git(cwd, ['rev-parse', '--show-toplevel'], signal)
   ])
   const files = parseDiffTree(diff)
+  const root = await hostPath(cwd, top.trim())
   const untracked = others.split('\0').filter(Boolean)
   const room = Math.max(0, maxFiles - files.length)
   const counted = await Promise.all(
     untracked.slice(0, room).map(async (path): Promise<FileChange> => {
-      const added = await countLines(join(top.trim(), path))
+      const added = await countLines(join(root, path))
       return { status: 'A', path, added, deleted: added === null ? null : 0, untracked: true }
     })
   )
@@ -303,11 +318,11 @@ export async function readWorktreeChanges(cwd: string, maxFiles: number, signal?
   }
 }
 
-/** The worktree's own git dir (HEAD, index) and the shared one (refs, packed-refs). */
+/** The worktree's own git dir (HEAD, index) and the shared one (refs, packed-refs), as `fs` paths. */
 export async function gitDirs(cwd: string): Promise<{ gitDir: string; commonDir: string }> {
   const out = await git(cwd, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'])
   const [gitDir, commonDir] = out.trim().split(/\r?\n/)
-  return { gitDir, commonDir }
+  return { gitDir: await hostPath(cwd, gitDir), commonDir: await hostPath(cwd, commonDir) }
 }
 
 export async function currentBranch(cwd: string): Promise<string | null> {
