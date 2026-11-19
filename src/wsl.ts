@@ -1,8 +1,8 @@
 // WSL support for Orca on Windows. A repository inside a WSL distribution reaches the worker
 // either as a UNC path (`\\wsl.localhost\<distro>\…`) or, when Orca runs the workspace in its
 // WSL runtime, as a plain Linux path (`/home/…`). Windows git can't use the Linux path and is
-// slow (and trips `safe.directory`) on the UNC one, and `fs.watch` gets no events from the WSL
-// share. So git runs inside the distribution through `wsl.exe`, and the worker polls instead.
+// slow (and trips `safe.directory`) on the UNC one, and `fs.watch` can't watch the WSL share.
+// So git runs inside the distribution through `wsl.exe`, and the worker polls instead.
 import { execFile } from 'node:child_process'
 
 export interface WslTarget {

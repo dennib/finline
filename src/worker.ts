@@ -38,8 +38,9 @@ const RELEVANT =
 // Remote actions wait on the network; local ones should be quick but a big rebase is not.
 const REMOTE_TIMEOUT_MS = 120_000
 const LOCAL_TIMEOUT_MS = 60_000
-// fs.watch gets no events from the WSL share, so repositories there are polled instead.
-const WSL_POLL_MS = 2000
+// fs.watch can't watch the WSL share (it throws EISDIR), so repositories there are polled
+// instead. Each poll starts wsl.exe and runs git status, so keep it infrequent.
+const WSL_POLL_MS = 10_000
 
 type Resolved =
   | { ok: true; path: string; resolvedBy: string }

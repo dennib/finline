@@ -69,8 +69,8 @@ remotes through git, with your git credentials.
 - Workspaces on remote (SSH) hosts are not supported yet.
 - On Windows, repositories inside WSL (whether Orca runs them in its WSL runtime or opens them as
   `\\wsl.localhost\…` folders) run `git` inside their distribution through `wsl.exe`, so that
-  distribution needs `git`. Windows gets no file events from WSL, so Finline checks those
-  repositories for changes every 2 seconds instead of watching them.
+  distribution needs `git`. Windows can't watch files inside WSL, so Finline checks those
+  repositories for changes every 10 seconds instead of watching them.
 
 ## Development
 
