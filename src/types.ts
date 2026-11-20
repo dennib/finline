@@ -30,6 +30,8 @@ export interface FileChange {
   /** Line counts; null for binary files. */
   added: number | null
   deleted: number | null
+  /** Not tracked by git yet (uncommitted changes only). */
+  untracked?: boolean
 }
 
 export interface CommitDetails {
@@ -50,6 +52,16 @@ export interface CommitDetails {
   /** More files changed than were sent. */
   filesTruncated: boolean
 }
+
+/** Everything not committed yet: index and working tree against HEAD, plus untracked files. */
+export interface WorktreeChanges {
+  /** The commit the changes are compared against. */
+  head: string
+  files: FileChange[]
+  filesTruncated: boolean
+}
+
+export type WorktreeLoad = { ok: true; changes: WorktreeChanges } | { ok: false; message: string }
 
 export type DetailsLoad = { ok: true; details: CommitDetails } | { ok: false; message: string }
 

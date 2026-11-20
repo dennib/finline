@@ -15,17 +15,22 @@ import {
   readCommitDetails,
   readCommits,
   readStatus,
+  readWorktreeChanges,
   registerRepoHost,
   remoteNames,
   runGit
 } from './git'
 import { getSshTargetMap, resolveRemoteWorkspace, selectRemoteWorkspace } from './remote'
-import type { ActionResult, Candidate, DetailsLoad, GraphLoad, StatusLoad } from './types'
+import type { ActionResult, Candidate, DetailsLoad, GraphLoad, StatusLoad, WorktreeLoad } from './types'
 
 const DEFAULT_LIMIT = 200
 // About 250 bytes of JSON per commit keeps a full page well under the 1 MiB answer cap.
 const MAX_LIMIT = 1000
 const DEBOUNCE_MS = 300
+// Edits in the working tree come in bursts (a save, a build, an install): wait for a pause,
+// but never longer than this, so a busy tree still refreshes.
+const WORKTREE_DEBOUNCE_MS = 500
+const WORKTREE_MAX_WAIT_MS = 3000
 // About 100 bytes of JSON per file; a huge commit lists the first ones and says it was cut.
 const MAX_FILES = 2000
 const HASH = /^[0-9a-f]{4,64}$/i
@@ -152,6 +157,9 @@ async function resolveRepo(orca: OrcaWorkerApi, preferredPath?: string): Promise
 
 let watcher: FSWatcher | null = null
 let pollInterval: ReturnType<typeof setInterval> | null = null
+let worktreeWatcher: FSWatcher | null = null
+// The main worktree holds the git dir; its changes are the other watcher's business.
+const IN_GIT_DIR = /^\.git([\\/]|$)/
 
 export default function activate(orca: OrcaWorkerApi): void {
   let watchedPath: string | null = null
@@ -166,6 +174,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (watchedPath === path && (watcher || pollInterval)) return true
     watcher?.close()
     watcher = null
+    worktreeWatcher?.close()
+    worktreeWatcher = null
     if (pollInterval) {
       clearInterval(pollInterval)
       pollInterval = null
@@ -210,11 +220,37 @@ export default function activate(orca: OrcaWorkerApi): void {
       })
       watcher.on('error', (error) => orca.log(`watch error: ${error.message}`))
       orca.log(`watching ${commonDir}`)
+      watchWorktree(path)
       return true
     } catch (error) {
       watchedPath = null
       orca.log(`watch failed: ${(error as Error).message}`)
       return false
+    }
+  }
+
+  let worktreeTimer: ReturnType<typeof setTimeout> | null = null
+  let worktreeSince = 0
+
+  /** Posts `worktree.changed` when files change, so the uncommitted-changes row stays current. */
+  function watchWorktree(path: string): void {
+    worktreeWatcher?.close()
+    worktreeWatcher = null
+    try {
+      worktreeWatcher = watch(path, { recursive: true }, (_event, file) => {
+        if (file && IN_GIT_DIR.test(String(file))) return
+        const now = Date.now()
+        if (!worktreeTimer) worktreeSince = now
+        else clearTimeout(worktreeTimer)
+        const wait = Math.max(0, Math.min(WORKTREE_DEBOUNCE_MS, worktreeSince + WORKTREE_MAX_WAIT_MS - now))
+        worktreeTimer = setTimeout(() => {
+          worktreeTimer = null
+          orca.panels.post('worktree.changed', { path })
+        }, wait)
+      })
+      worktreeWatcher.on('error', (error) => orca.log(`worktree watch error: ${error.message}`))
+    } catch (error) {
+      orca.log(`worktree watch failed: ${(error as Error).message}`)
     }
   }
 
@@ -302,6 +338,15 @@ export default function activate(orca: OrcaWorkerApi): void {
     return { ok: true }
   })
 
+  orca.panels.handle('worktree.changes', async ({ path }, { signal }): Promise<WorktreeLoad> => {
+    if (!served.has(path)) return { ok: false, message: 'Unknown repository; reload the graph.' }
+    try {
+      return { ok: true, changes: await readWorktreeChanges(path, MAX_FILES, signal) }
+    } catch (error) {
+      return { ok: false, message: (error as Error).message }
+    }
+  })
+
   orca.panels.handle('commit.details', async ({ path, hash }, { signal }): Promise<DetailsLoad> => {
     if (!served.has(path)) return { ok: false, message: 'Unknown repository; reload the graph.' }
     if (!HASH.test(hash)) return { ok: false, message: `Not a commit hash: ${hash}` }
@@ -316,6 +361,8 @@ export default function activate(orca: OrcaWorkerApi): void {
 export function deactivate(): void {
   watcher?.close()
   watcher = null
+  worktreeWatcher?.close()
+  worktreeWatcher = null
   if (pollInterval) {
     clearInterval(pollInterval)
     pollInterval = null

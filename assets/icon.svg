@@ -7,8 +7,6 @@
     </linearGradient>
   </defs>
   <rect width="256" height="256" rx="56" fill="url(#bg)" />
-  <!-- waterline -->
-  <path d="M 32 200 Q 60 190 88 200 T 144 200 T 200 200 T 228 198" fill="none" stroke="#3b82f6" stroke-opacity="0.35" stroke-width="6" stroke-linecap="round" />
   <g fill="none" stroke-width="12" stroke-linecap="round">
     <!-- leading edge: convex, sweeping back -->
     <path d="M 52 194 C 66 118 128 58 196 44" stroke="#3b82f6" />
@@ -16,6 +14,11 @@
     <path d="M 124 194 C 126 140 148 80 196 44" stroke="#10b981" />
     <!-- trailing edge: concave -->
     <path d="M 204 194 C 170 172 160 108 196 44" stroke="#ec4899" />
+  </g>
+  <!-- waterline, as thick as the lanes and drawn over their ends: the fin rises out of the water -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M 44 200 Q 72 189 100 200 T 156 200 T 212 200" stroke="#0f1420" stroke-width="22" />
+    <path d="M 44 200 Q 72 189 100 200 T 156 200 T 212 200" stroke="#334155" stroke-width="12" />
   </g>
   <g stroke="#0d111c" stroke-width="5">
     <circle cx="102" cy="99" r="10" fill="#3b82f6" />

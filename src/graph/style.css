@@ -207,6 +207,24 @@ button {
   background: var(--hover);
 }
 
+/* Uncommitted changes: a dashed line from a hollow node down to HEAD. */
+.graph path.wip {
+  stroke-dasharray: 3 3;
+}
+
+.graph circle.wip {
+  fill: var(--bg);
+  stroke-dasharray: 2 2;
+}
+
+.row.wip .subject {
+  font-style: italic;
+}
+
+.row.wip .author {
+  max-width: none;
+}
+
 .row[aria-selected='true'] {
   background: var(--selected);
 }
@@ -538,6 +556,10 @@ button.tree-row:hover .name {
 
 .file.s-U .name {
   color: var(--lane-1);
+}
+
+.file.untracked .name {
+  font-style: italic;
 }
 
 .details .pending {
