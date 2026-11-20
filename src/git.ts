@@ -1,10 +1,10 @@
 // Thin wrapper over the system `git`, run with execFile (no shell) so paths with spaces and
-// Windows drive letters pass through untouched. Repositories inside WSL run git in their
-// distribution through `wsl.exe` (see `./wsl`).
+// Windows drive letters pass through untouched. `gitCommand` decides where git runs: here, over
+// ssh on a remote host (see `./remote`), or in a WSL distribution through `wsl.exe` (see `./wsl`).
 import { execFile } from 'node:child_process'
 import { access, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { hostPath, WSL_EXE, withWslEnv, wslGitArgs, wslTarget } from './wsl.ts'
+import { uncPath, WSL_EXE, withWslEnv, wslGitArgs, wslTarget, type WslTarget } from './wsl.ts'
 import type { Commit, CommitDetails, FileChange, FileStatus, Operation, Ref, RepoStatus, WorktreeChanges } from './types'
 
 const FIELD = '\x1f'
@@ -12,15 +12,73 @@ const RECORD = '\x1e'
 // hash, short hash, parents, author, author time (unix s), decorations, subject
 const FORMAT = ['%H', '%h', '%P', '%an', '%at', '%D', '%s'].join('%x1f') + '%x1e'
 
-/** The program and arguments that run git with `args` in `cwd`'s repository. */
-async function gitCommand(cwd: string, args: string[]): Promise<[string, string[]]> {
+// Maps repository path to SSH host alias (or null for local)
+const repoHosts = new Map<string, string | null>()
+
+export function registerRepoHost(path: string, sshHost: string | null): void {
+  repoHosts.set(path.replace(/\\/g, '/').toLowerCase(), sshHost)
+}
+
+export function getRepoHost(path: string): string | null {
+  return repoHosts.get(path.replace(/\\/g, '/').toLowerCase()) ?? null
+}
+
+/** Quotes one word for a POSIX shell: the remote sshd hands ssh's command line to the login shell. */
+export function shQuote(arg: string): string {
+  return /^[\w.\/@:+=,-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`
+}
+
+/** An ssh destination: no leading `-` (ssh would read it as an option), no spaces or control characters. */
+export function isSafeSshHost(host: string): boolean {
+  return /^[\w.@:\[\]%-]+$/.test(host) && !host.startsWith('-')
+}
+
+/**
+ * Arguments for `ssh` that run one command on `host`. ssh joins everything after the host with
+ * spaces and the remote shell re-parses it, so each word is quoted here; the `--` keeps the host
+ * from ever being read as an option.
+ */
+export function sshArgs(host: string, command: readonly string[]): string[] {
+  if (!isSafeSshHost(host)) throw new Error(`Refusing to connect to SSH host "${host}".`)
+  return ['-T', '-o', 'BatchMode=yes', '--', host, command.map(shQuote).join(' ')]
+}
+
+// Same as the local runGit env: no prompts, no editors, on the remote too.
+const REMOTE_ACTION_ENV = ['env', 'GIT_TERMINAL_PROMPT=0', 'GIT_EDITOR=true', 'GIT_SEQUENCE_EDITOR=true', 'GIT_MERGE_AUTOEDIT=no']
+
+/** Where git runs for a WSL repository, never for one registered on an ssh host. */
+function wslFor(cwd: string): Promise<WslTarget | null> {
+  return getRepoHost(cwd) ? Promise.resolve(null) : wslTarget(cwd)
+}
+
+/** A path git printed for `cwd`'s repository, as Node's `fs` on this machine can open it. */
+async function fsPath(cwd: string, gitPath: string): Promise<string> {
+  const target = await wslFor(cwd)
+  return target ? uncPath(target.distro, gitPath) : gitPath
+}
+
+/**
+ * The program and arguments that run git with `args` in `cwd`'s repository: over ssh for a
+ * registered remote host, through wsl.exe for a repository inside WSL, otherwise the system git.
+ * `action` adds the no-prompt env on the remote (WSL gets it through WSLENV, see runGit).
+ */
+async function gitCommand(
+  cwd: string,
+  args: string[],
+  action = false
+): Promise<{ file: string; argv: string[]; via: 'local' | 'ssh' | 'wsl' }> {
   const base = ['-c', 'core.quotepath=off', '-c', 'color.ui=false', ...args]
+  const sshHost = getRepoHost(cwd)
+  if (sshHost) {
+    return { file: 'ssh', argv: sshArgs(sshHost, [...(action ? REMOTE_ACTION_ENV : []), 'git', '-C', cwd, ...base]), via: 'ssh' }
+  }
   const target = await wslTarget(cwd)
-  return target ? [WSL_EXE, wslGitArgs(target, base)] : ['git', ['-C', cwd, ...base]]
+  if (target) return { file: WSL_EXE, argv: wslGitArgs(target, base), via: 'wsl' }
+  return { file: 'git', argv: ['-C', cwd, ...base], via: 'local' }
 }
 
 export async function git(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
-  const [file, argv] = await gitCommand(cwd, args)
+  const { file, argv } = await gitCommand(cwd, args)
   return new Promise((resolve, reject) => {
     execFile(
       file,
@@ -50,7 +108,14 @@ export async function runGit(
   args: string[],
   opts: { timeoutMs: number; signal?: AbortSignal }
 ): Promise<RunResult> {
-  const [file, argv] = await gitCommand(cwd, args)
+  let command: { file: string; argv: string[]; via: string }
+  try {
+    command = await gitCommand(cwd, args, true)
+  } catch (error) {
+    // sshArgs refuses an unsafe host
+    return { code: 1, stdout: '', stderr: (error as Error).message, timedOut: false }
+  }
+  const { file, argv } = command
   const vars = {
     ...process.env,
     GIT_TERMINAL_PROMPT: '0', // fail instead of asking for a username or password
@@ -60,7 +125,7 @@ export async function runGit(
     GCM_INTERACTIVE: 'auto' // Git Credential Manager may still show its own sign-in window
   }
   // wsl.exe hands only the variables listed in WSLENV on to git in the distribution.
-  const env = file === WSL_EXE ? withWslEnv(vars, Object.keys(vars)) : vars
+  const env = command.via === 'wsl' ? withWslEnv(vars, Object.keys(vars)) : vars
   return new Promise((resolve) => {
     const child = execFile(
       file,
@@ -123,11 +188,40 @@ export async function readStatus(cwd: string, signal?: AbortSignal): Promise<Rep
     remoteNames(cwd),
     gitDirs(cwd)
   ])
-  return { ...parseStatus(out), operation: await operationInProgress(gitDir), remotes }
+  return { ...parseStatus(out), operation: await operationInProgress(cwd, gitDir), remotes }
 }
 
 /** Which multi-step operation is stopped, from the marker files git leaves in the git dir. */
-async function operationInProgress(gitDir: string): Promise<Operation | null> {
+async function operationInProgress(cwd: string, gitDir: string): Promise<Operation | null> {
+  const sshHost = getRepoHost(cwd)
+  if (sshHost) {
+    try {
+      const out = await new Promise<string>((resolve, reject) => {
+        // Fixed script, the git dir passed as $1 so it is never parsed as shell code.
+        const script =
+          'if test -d "$1/rebase-merge" || test -d "$1/rebase-apply"; then echo rebase; ' +
+          'elif test -f "$1/MERGE_HEAD"; then echo merge; ' +
+          'elif test -f "$1/CHERRY_PICK_HEAD"; then echo cherry-pick; ' +
+          'elif test -f "$1/REVERT_HEAD"; then echo revert; else echo none; fi'
+        execFile(
+          'ssh',
+          sshArgs(sshHost, ['sh', '-c', script, 'finline', gitDir]),
+          { encoding: 'utf8', timeout: 5000 },
+          (error, stdout) => {
+            if (error) reject(error)
+            else resolve(stdout.trim())
+          }
+        )
+      })
+      if (out === 'rebase' || out === 'merge' || out === 'cherry-pick' || out === 'revert') {
+        return out
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+
   const exists = (name: string) =>
     access(join(gitDir, name)).then(
       () => true,
@@ -301,7 +395,7 @@ export async function readWorktreeChanges(cwd: string, maxFiles: number, signal?
     git(cwd, ['rev-parse', '--show-toplevel'], signal)
   ])
   const files = parseDiffTree(diff)
-  const root = await hostPath(cwd, top.trim())
+  const root = await fsPath(cwd, top.trim())
   const untracked = others.split('\0').filter(Boolean)
   const room = Math.max(0, maxFiles - files.length)
   const counted = await Promise.all(
@@ -322,7 +416,7 @@ export async function readWorktreeChanges(cwd: string, maxFiles: number, signal?
 export async function gitDirs(cwd: string): Promise<{ gitDir: string; commonDir: string }> {
   const out = await git(cwd, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'])
   const [gitDir, commonDir] = out.trim().split(/\r?\n/)
-  return { gitDir: await hostPath(cwd, gitDir), commonDir: await hostPath(cwd, commonDir) }
+  return { gitDir: await fsPath(cwd, gitDir), commonDir: await fsPath(cwd, commonDir) }
 }
 
 export async function currentBranch(cwd: string): Promise<string | null> {

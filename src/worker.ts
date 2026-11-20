@@ -1,5 +1,5 @@
-// Finline's worker: finds the focused workspace's repository, reads it with the system `git`,
-// runs the git actions the panel asks for, and watches the git dir so open panels refresh.
+// Finline's worker: finds the focused workspace's repository (local, in WSL, or remote via SSH),
+// reads it with git, runs the git actions the panel asks for, and watches/polls the repo so open panels refresh.
 import { watch, type FSWatcher } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { basename } from 'node:path'
@@ -8,15 +8,19 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import { AUTH_FAILURE, buildArgs, CONFLICT, isRemoteAction } from './actions'
 import {
   currentBranch,
+  getRepoHost,
+  git,
   gitDirs,
   gitVersion,
   readCommitDetails,
   readCommits,
   readStatus,
   readWorktreeChanges,
+  registerRepoHost,
   remoteNames,
   runGit
 } from './git'
+import { getSshTargetMap, resolveRemoteWorkspace, selectRemoteWorkspace } from './remote'
 import { wslFingerprint, wslLookupError, wslTarget, type WslTarget } from './wsl.ts'
 import type { ActionResult, Candidate, DetailsLoad, GraphLoad, StatusLoad, WorktreeLoad } from './types'
 
@@ -43,7 +47,7 @@ const LOCAL_TIMEOUT_MS = 60_000
 const WSL_POLL_MS = 10_000
 
 type Resolved =
-  | { ok: true; path: string; resolvedBy: string }
+  | { ok: true; path: string; resolvedBy: string; workspaceId?: string }
   | Exclude<GraphLoad, { ok: true } | { reason: 'git-failed' }>
 
 const isLocal = (hostId: string | null) => hostId === null || hostId === 'local'
@@ -63,9 +67,15 @@ async function devOverride(): Promise<string | null> {
   }
 }
 
+// Stores workspace ID for a resolved path so git.terminal can open a terminal even for remote worktrees
+const workspaceIdByPath = new Map<string, string>()
+
 async function resolveRepo(orca: OrcaWorkerApi, preferredPath?: string): Promise<Resolved> {
   const override = await devOverride()
-  if (override) return { ok: true, path: override, resolvedBy: 'dev override (.orca/dev-repo.txt)' }
+  if (override) {
+    registerRepoHost(override, null)
+    return { ok: true, path: override, resolvedBy: 'dev override (.orca/dev-repo.txt)' }
+  }
 
   const context = await orca.host.call('workspace.readContext', {})
   if (!context) return { ok: false, reason: 'no-workspace', message: 'No workspace is focused.' }
@@ -75,49 +85,98 @@ async function resolveRepo(orca: OrcaWorkerApi, preferredPath?: string): Promise
   // while workspace.list may give the same row an identity-based id, so compare both forms.
   const id = context.workspaceId
   const byId = id ? workspaces.filter((w) => w.id === id || `${w.projectId}::${w.path}` === id) : []
-  if (byId.length > 0 && isLocal(byId[0].hostId)) return { ok: true, path: byId[0].path, resolvedBy: 'workspace id' }
+  const found = (w: { path: string; id: string }, resolvedBy: string): Resolved => {
+    registerRepoHost(w.path, null)
+    workspaceIdByPath.set(w.path, w.id)
+    return { ok: true, path: w.path, resolvedBy, workspaceId: w.id }
+  }
+  if (byId.length > 0 && isLocal(byId[0].hostId)) return found(byId[0], 'workspace id')
   // Without an id, match by name and branch.
   const matches =
     byId.length > 0
       ? byId
       : workspaces.filter((w) => w.name === context.displayName && (w.branch ?? null) === (context.branch || null))
-  const local = matches.filter((w) => isLocal(w.hostId))
 
-  if (local.length === 0) {
-    if (matches.length > 0) {
-      return { ok: false, reason: 'remote', message: `"${context.displayName}" is on a remote host (${matches[0].hostId}), not supported yet.` }
-    }
-    // Workspaces of Orca's WSL runtime can be missing from workspace.list; the id still names
-    // the path, which is usable when it exists inside a WSL distribution.
-    const idPath = id?.includes('::') ? id.slice(id.indexOf('::') + 2) : null
-    if (idPath && (await wslTarget(idPath))) return { ok: true, path: idPath, resolvedBy: 'workspace id (WSL path)' }
-    orca.log(
-      `no workspace matches ${JSON.stringify(context)}; listed: ${JSON.stringify(
-        workspaces.map((w) => ({ id: w.id, name: w.name, branch: w.branch, hostId: w.hostId, path: w.path, projectId: w.projectId }))
-      )}`
-    )
+  const local = matches.filter((w) => isLocal(w.hostId))
+  if (local.length === 1) return found(local[0], 'name+branch (local)')
+
+  if (local.length > 1) {
+    const pinned = preferredPath ? local.find((w) => samePath(w.path, preferredPath)) : undefined
+    if (pinned) return found(pinned, `pinned (1 of ${local.length})`)
+    const candidates: Candidate[] = local.map((w) => ({ path: w.path, name: basename(w.path), branch: w.branch }))
     return {
       ok: false,
-      reason: 'not-found',
-      message: [
-        `No local workspace "${context.displayName}" on ${context.branch || 'no branch'} (id ${id ?? 'none'}).`,
-        idPath ? wslLookupError() : null
-      ]
-        .filter(Boolean)
-        .join('\n')
+      reason: 'ambiguous',
+      message: `${local.length} workspaces are named "${context.displayName}" on ${context.branch}.`,
+      candidates
     }
   }
-  if (local.length === 1) return { ok: true, path: local[0].path, resolvedBy: 'name+branch' }
 
-  const pinned = preferredPath ? local.find((w) => samePath(w.path, preferredPath)) : undefined
-  if (pinned) return { ok: true, path: pinned.path, resolvedBy: `pinned (1 of ${local.length})` }
+  // If remote workspaces were reported directly by workspace.list
+  const remoteMatches = matches.filter((w) => !isLocal(w.hostId))
+  if (remoteMatches.length > 0) {
+    const targetMap = await getSshTargetMap()
+    // Only hosts we can map to an SSH alias: a raw hostId may not be one, and git would run elsewhere.
+    const resolvable = remoteMatches.flatMap((w) => {
+      const sshHost = w.hostId ? targetMap.get(w.hostId) : undefined
+      return sshHost ? [{ path: w.path, sshHost, workspaceId: w.id, branch: w.branch ?? undefined, name: basename(w.path) }] : []
+    })
+    if (resolvable.length === 0) {
+      return {
+        ok: false,
+        reason: 'not-found',
+        message: `"${context.displayName}" is on a remote host whose SSH alias Finline can't find.`
+      }
+    }
+    // Same picker and pinning as local repos when several remote workspaces match.
+    const picked = selectRemoteWorkspace(resolvable, context, preferredPath)
+    if (!picked.ok) return picked
+    registerRepoHost(picked.path, picked.sshHost)
+    if (picked.workspaceId) workspaceIdByPath.set(picked.path, picked.workspaceId)
+    return { ok: true, path: picked.path, resolvedBy: picked.resolvedBy, workspaceId: picked.workspaceId }
+  }
 
-  const candidates: Candidate[] = local.map((w) => ({ path: w.path, name: basename(w.path), branch: w.branch }))
+  // Workspaces of Orca's WSL runtime can be missing from workspace.list; the id still names
+  // the path, which is usable when it exists inside a WSL distribution.
+  const idPath = id?.includes('::') ? id.slice(id.indexOf('::') + 2) : null
+  if (idPath && (await wslTarget(idPath))) {
+    registerRepoHost(idPath, null)
+    if (id) workspaceIdByPath.set(idPath, id)
+    return { ok: true, path: idPath, resolvedBy: 'workspace id (WSL path)', workspaceId: id }
+  }
+
+  // Last resort: remote workspaces workspace.list doesn't report, from Orca's profile state (macOS).
+  const remoteResolved = await resolveRemoteWorkspace(context, preferredPath)
+  if (remoteResolved.ok) {
+    registerRepoHost(remoteResolved.path, remoteResolved.sshHost)
+    if (remoteResolved.workspaceId) {
+      workspaceIdByPath.set(remoteResolved.path, remoteResolved.workspaceId)
+    }
+    return {
+      ok: true,
+      path: remoteResolved.path,
+      resolvedBy: remoteResolved.resolvedBy,
+      workspaceId: remoteResolved.workspaceId
+    }
+  }
+
+  if (remoteResolved.reason === 'ambiguous') return remoteResolved
+
+  orca.log(
+    `no workspace matches ${JSON.stringify(context)}; listed: ${JSON.stringify(
+      workspaces.map((w) => ({ id: w.id, name: w.name, branch: w.branch, hostId: w.hostId, path: w.path, projectId: w.projectId }))
+    )}`
+  )
   return {
     ok: false,
-    reason: 'ambiguous',
-    message: `${local.length} workspaces are named "${context.displayName}" on ${context.branch}.`,
-    candidates
+    reason: 'not-found',
+    message: [
+      `No workspace "${context.displayName}" on ${context.branch || 'no branch'} (id ${id ?? 'none'}).`,
+      idPath ? wslLookupError() : null
+    ]
+      .filter(Boolean)
+      .join('
+')
   }
 }
 
@@ -130,13 +189,42 @@ const IN_GIT_DIR = /^\.git([\\/]|$)/
 export default function activate(orca: OrcaWorkerApi): void {
   let watchedPath: string | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
+  let lastHeadHash: string | null = null
+
   // Repos graph.load has resolved: commit.details runs git only in one of these.
   const served = new Set<string>()
 
   async function watchRepo(path: string): Promise<boolean> {
+    // A failed local watch leaves watcher null, so the next load retries it.
     if (watchedPath === path && (watcher || poller)) return true
     stopWatching()
     watchedPath = path
+
+    const sshHost = getRepoHost(path)
+    if (sshHost) {
+      // Remote repository: poll git rev-parse HEAD every 3 seconds for ref changes
+      try {
+        lastHeadHash = (await git(path, ['rev-parse', 'HEAD'])).trim()
+      } catch {
+        lastHeadHash = null
+      }
+      poller = setInterval(async () => {
+        if (watchedPath !== path) return
+        try {
+          const currentHead = (await git(path, ['rev-parse', 'HEAD'])).trim()
+          if (lastHeadHash && currentHead !== lastHeadHash) {
+            lastHeadHash = currentHead
+            orca.log(`remote repo changed (${path}), notifying panels`)
+            orca.panels.post('repo.changed', { path })
+          }
+        } catch {
+          // Ignore transient errors
+        }
+      }, 3000)
+      orca.log(`watching remote repo ${sshHost}:${path} (poll 3s)`)
+      return true
+    }
+
     try {
       const target = await wslTarget(path)
       if (target) {
@@ -285,10 +373,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     const built = buildArgs(action, { remotes: await remoteNames(path) })
     if (!built.ok) return { ok: false, message: built.message }
     const { workspaces } = await orca.host.call('workspace.list', {})
-    const context = await orca.host.call('workspace.readContext', {})
-    // A WSL runtime workspace may be missing from workspace.list; its id (`<projectId>::<path>`) still works.
-    const focusedId = context?.workspaceId?.endsWith(`::${path}`) ? context.workspaceId : undefined
-    const workspaceId = workspaces.find((w) => samePath(w.path, path))?.id ?? focusedId
+    // resolveRepo remembers the id of workspaces workspace.list leaves out (WSL runtime, remote).
+    const workspaceId = workspaces.find((w) => samePath(w.path, path))?.id ?? workspaceIdByPath.get(path)
     if (!workspaceId) return { ok: false, message: 'No Orca workspace has this repository open.' }
     // Every argument passed buildArgs' checks (names from a safe character set), so plain
     // quoting is enough for any shell the terminal runs.
