@@ -12,11 +12,12 @@ import type {
   Ref,
   RepoInfo,
   RepoStatus,
+  Stash,
   StatusLoad,
   WorktreeChanges,
   WorktreeLoad
 } from '../types.ts'
-import { commitMenu, createToolbar, initActions, refMenu, renderBanner } from './actions.ts'
+import { commitMenu, createToolbar, initActions, refMenu, renderBanner, stashMenu, worktreeMenu } from './actions.ts'
 import { el, icon, ICONS, moving, svg } from './dom.ts'
 import { orca } from './frame.ts'
 
@@ -45,6 +46,8 @@ const bannerEl = $<HTMLElement>('banner')
 let repo: RepoInfo | null = null
 /** Commits loaded so far, in `git log` order; paging counts these. */
 let commits: Commit[] = []
+/** Every stash of the repo; each gets a row above the commit it was made on. */
+let stashes: Stash[] = []
 /** What the list shows: the uncommitted-changes row, when there is one, then `commits`. */
 let rows: Commit[] = []
 let hasMore = false
@@ -154,6 +157,7 @@ async function apply(result: GraphLoad, append: boolean): Promise<void> {
   if (!result.ok) {
     repo = null
     commits = []
+    stashes = []
     hasMore = false
     detailsCache.clear()
     select(null)
@@ -168,6 +172,7 @@ async function apply(result: GraphLoad, append: boolean): Promise<void> {
   const shown = new Set(switched ? [] : commits.map((c) => c.hash))
   repo = result.repo
   commits = append ? commits.concat(result.commits) : result.commits
+  stashes = result.stashes ?? []
   hasMore = result.hasMore
   if (switched) {
     status = null // the other repo's: no uncommitted-changes row until this one's status arrives
@@ -352,9 +357,52 @@ let graphWidth = 0
 let nodeEls: SVGCircleElement[] = []
 let hotRow = -1
 
+/** A stash as a row: its own hash, the commit it was made on as only parent. */
+function stashCommit(stash: Stash, withBase: boolean): Commit {
+  const name = `stash@{${stash.index}}`
+  return {
+    hash: stash.hash,
+    shortHash: stash.hash.slice(0, 7),
+    parents: withBase && stash.base ? [stash.base] : [],
+    author: stash.branch ? `on ${stash.branch}` : '',
+    authoredAt: stash.createdAt,
+    subject: stash.message,
+    refs: [{ name, kind: 'stash' }]
+  }
+}
+
+const stashOf = (hash: string | null | undefined) => (hash ? stashes.find((s) => s.hash === hash) : undefined)
+
+/**
+ * The uncommitted-changes row, then the commits, each stash right above the commit it was made
+ * on. A stash whose base is not in the graph (unreachable now) goes last, once all is loaded.
+ */
+function buildRows(wip: Commit | null): Commit[] {
+  if (stashes.length === 0) return wip ? [wip, ...commits] : commits
+  const loaded = new Set(commits.map((c) => c.hash))
+  const above = new Map<string, Commit[]>()
+  const adrift: Commit[] = []
+  for (const stash of stashes) {
+    if (stash.base && loaded.has(stash.base)) {
+      const list = above.get(stash.base) ?? []
+      list.push(stashCommit(stash, true))
+      above.set(stash.base, list)
+    } else if (!hasMore) {
+      adrift.push(stashCommit(stash, false))
+    }
+  }
+  const list: Commit[] = wip ? [wip] : []
+  for (const commit of commits) {
+    const mine = above.get(commit.hash)
+    if (mine) list.push(...mine)
+    list.push(commit)
+  }
+  return list.concat(adrift)
+}
+
 function renderList(): void {
   const wip = wipCommit()
-  rows = wip ? [wip, ...commits] : commits
+  rows = buildRows(wip)
   layout = layoutGraph(rows)
   graphWidth = PAD_X * 2 + Math.max(1, layout.width) * COL_W
   if (rows.length === 0) {
@@ -383,10 +431,11 @@ function drawGraph(): void {
 
   graphEl.setAttribute('width', String(graphWidth))
   graphEl.setAttribute('height', String(rows.length * ROW_H + extra + (hasMore ? ROW_H : 0)))
-  const wip = rows[0]?.hash === WORKTREE
+  // Rows that are not commits of the history hang from it on a dashed line.
+  const aside = rows.map((c) => c.hash === WORKTREE || c.refs[0]?.kind === 'stash')
   const paths = layout.edges.map((edge) => {
     const path = svg('path', { d: edgePath(edge, x, y, ROW_H), stroke: laneColor(edge.color) })
-    if (wip && edge.fromRow === 0) path.classList.add('wip')
+    if (aside[edge.fromRow]) path.classList.add('wip')
     return path
   })
   nodeEls = rows.map((commit, row) => {
@@ -400,6 +449,7 @@ function drawGraph(): void {
     })
     node.classList.toggle('head', isHead)
     node.classList.toggle('wip', commit.hash === WORKTREE)
+    node.classList.toggle('stash', aside[row] && commit.hash !== WORKTREE)
     node.classList.toggle('hot', row === hotRow)
     node.classList.toggle('picked', commit.hash === selected)
     return node
@@ -417,12 +467,13 @@ function setHotRow(row: number): void {
 
 function renderRow(commit: Commit, indent: number, color: number): HTMLElement {
   const isHead = commit.refs.some((r) => r.kind === 'head' || r.kind === 'detached')
-  const row = el('div', isHead ? 'row head' : 'row')
+  const isStash = commit.refs[0]?.kind === 'stash'
+  const row = el('div', isHead ? 'row head' : isStash ? 'row stash' : 'row')
   row.style.paddingLeft = `${indent}px`
   row.dataset.hash = commit.hash
   row.setAttribute('role', 'option')
   row.setAttribute('aria-selected', String(commit.hash === selected))
-  row.title = `${commit.shortHash} · ${commit.author} · ${new Date(commit.authoredAt).toLocaleString()}\n${commit.subject}`
+  row.title = `${isStash ? commit.refs[0].name : commit.shortHash} · ${commit.author} · ${new Date(commit.authoredAt).toLocaleString()}\n${commit.subject}${isStash ? '\nStashed changes: right-click to apply, pop or drop' : ''}`
   row.append(...renderRefs(commit.refs, color))
   row.append(
     el('span', 'subject', commit.subject),
@@ -478,6 +529,7 @@ function renderRefs(refs: Ref[], color: number): HTMLElement[] {
   }
   for (const ref of remotes) if (!absorbed.has(ref)) badge(ref, 'remote-only', ref.name)
   for (const ref of refs) if (ref.kind === 'tag') badge(ref, 'tag', ref.name)
+  for (const ref of refs) if (ref.kind === 'stash') badge(ref, 'stash', ref.name)
   return badges
 }
 
@@ -597,7 +649,8 @@ async function loadDetails(hash: string | null): Promise<void> {
     if (mine === detailsSeq) renderDetailsMessage('pending', 'Loading…')
   }, 150)
   try {
-    const result: DetailsLoad = await orca.plugin.request('commit.details', { path: repo.path, hash })
+    const untracked = stashOf(hash)?.untracked
+    const result: DetailsLoad = await orca.plugin.request('commit.details', { path: repo.path, hash, ...(untracked ? { untracked } : {}) })
     clearTimeout(slow)
     if (mine !== detailsSeq) return
     if (!result.ok) {
@@ -651,16 +704,16 @@ function renderWorktree(changes: WorktreeChanges): void {
   info.append(meta)
   const grid = el('div', 'details-grid')
   grid.append(info, renderFiles(changes.files, changes.filesTruncated))
-  morphDetails(() => detailsEl.replaceChildren(detailsControls(false), grid))
+  morphDetails(() => detailsEl.replaceChildren(detailsControls(), grid))
 }
 
-/** Top-right of the details: the commit's actions (⋯, not for uncommitted changes) and close. */
-function detailsControls(withMenu = true): HTMLElement {
+/** Top-right of the details: the row's actions (⋯) and close. */
+function detailsControls(): HTMLElement {
   const controls = el('div', 'details-controls')
   const more = el('button', 'icon details-more')
   more.type = 'button'
-  more.title = 'Actions (right-click a commit or badge, or Shift+F10)'
-  more.setAttribute('aria-label', 'Commit actions')
+  more.title = 'Actions (right-click a row or badge, or Shift+F10)'
+  more.setAttribute('aria-label', 'Actions')
   more.setAttribute('aria-haspopup', 'menu')
   more.append(icon(ICONS.more))
   more.addEventListener('click', () => openSelectedMenu(more))
@@ -673,7 +726,7 @@ function detailsControls(withMenu = true): HTMLElement {
     select(null)
     listEl.focus()
   })
-  controls.append(...(withMenu ? [more, close] : [close]))
+  controls.append(more, close)
   return controls
 }
 
@@ -690,16 +743,26 @@ function renderDetails(d: CommitDetails): void {
     dd.append(...value)
     meta.append(el('dt', '', `${label}:`), dd)
   }
-  field('Commit', el('span', 'mono', d.hash))
-  if (d.parents.length > 0) field(d.parents.length > 1 ? 'Parents' : 'Parent', ...d.parents.map(parentLink))
-  field('Author', ...person(d.author, d.authorEmail))
-  field('Author Date', el('span', '', fullDate(d.authoredAt)))
-  field('Committer', ...person(d.committer, d.committerEmail))
-  field('Committer Date', el('span', '', fullDate(d.committedAt)))
-  info.append(meta, el('pre', 'details-message', d.message))
+  const stash = stashOf(d.hash)
+  if (stash) {
+    // A stash is a merge of helper commits; what matters is where it was made and when.
+    field('Stash', el('span', 'mono', `stash@{${stash.index}}`))
+    if (stash.base) field('Made on', parentLink(stash.base))
+    if (stash.branch) field('Branch', el('span', '', stash.branch))
+    field('Date', el('span', '', fullDate(stash.createdAt)))
+    info.append(meta, el('pre', 'details-message', stash.message))
+  } else {
+    field('Commit', el('span', 'mono', d.hash))
+    if (d.parents.length > 0) field(d.parents.length > 1 ? 'Parents' : 'Parent', ...d.parents.map(parentLink))
+    field('Author', ...person(d.author, d.authorEmail))
+    field('Author Date', el('span', '', fullDate(d.authoredAt)))
+    field('Committer', ...person(d.committer, d.committerEmail))
+    field('Committer Date', el('span', '', fullDate(d.committedAt)))
+    info.append(meta, el('pre', 'details-message', d.message))
+  }
 
   const grid = el('div', 'details-grid')
-  const mergeBase = d.parents.length > 1 && d.comparedTo ? d.comparedTo : undefined
+  const mergeBase = !stash && d.parents.length > 1 && d.comparedTo ? d.comparedTo : undefined
   grid.append(info, renderFiles(d.files, d.filesTruncated, mergeBase))
   morphDetails(() => detailsEl.replaceChildren(detailsControls(), grid))
 }
@@ -875,25 +938,33 @@ rowsEl.addEventListener('click', (event) => {
 rowsEl.addEventListener('contextmenu', (event) => {
   const target = event.target as Element
   const row = target.closest<HTMLElement>('.row')
-  const commit = row ? commits.find((c) => c.hash === row.dataset.hash) : undefined
-  if (!row || !commit) return
+  const hash = row?.dataset.hash
+  const commit = commits.find((c) => c.hash === hash)
+  const stash = stashOf(hash)
+  if (!row || !(commit || stash || hash === WORKTREE)) return
   event.preventDefault()
   const at = { x: event.clientX, y: event.clientY }
   const options = { returnFocus: listEl, onClose: () => row.classList.remove('menu-target') }
   row.classList.add('menu-target')
   const badge = target.closest('.ref')
   const info = badge ? badgeRefs.get(badge) : undefined
-  if (info) refMenu(info.ref, info.remotes, commit, at, options)
+  if (stash) stashMenu(stash, at, options)
+  else if (!commit) worktreeMenu(at, options)
+  else if (info) refMenu(info.ref, info.remotes, commit, at, options)
   else commitMenu(commit, at, options)
 })
 
 /** The selected commit's menu, opened from the keyboard or the details' ⋯ button. */
 function openSelectedMenu(anchor?: Element): void {
   const commit = commits.find((c) => c.hash === selected)
+  const stash = stashOf(selected)
   const row = selected ? rowOf(selected) : null
-  if (!commit || !row) return
+  if (!row) return
   const box = (anchor ?? row).getBoundingClientRect()
-  commitMenu(commit, { x: anchor ? box.right - 4 : box.left + graphWidth, y: box.bottom }, { returnFocus: listEl })
+  const at = { x: anchor ? box.right - 4 : box.left + graphWidth, y: box.bottom }
+  if (stash) stashMenu(stash, at, { returnFocus: listEl })
+  else if (commit) commitMenu(commit, at, { returnFocus: listEl })
+  else if (selected === WORKTREE) worktreeMenu(at, { returnFocus: listEl })
 }
 
 listEl.addEventListener('keydown', (event) => {

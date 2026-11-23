@@ -8,8 +8,11 @@ declare module 'orca' {
      * `preferredPath` picks among workspaces that share a name and branch.
      */
     'graph.load': { input: { limit?: number; skip?: number; preferredPath?: string }; output: GraphLoad }
-    /** Full message, author/committer and changed files of one commit in a repo `graph.load` returned. */
-    'commit.details': { input: { path: string; hash: string }; output: DetailsLoad }
+    /**
+     * Full message, author/committer and changed files of one commit in a repo `graph.load` returned.
+     * For a stash, `untracked` is its untracked-files commit, whose files are added to the list.
+     */
+    'commit.details': { input: { path: string; hash: string; untracked?: string }; output: DetailsLoad }
     /** Uncommitted changes (staged, unstaged, untracked) against HEAD, as a file list. */
     'worktree.changes': { input: { path: string }; output: WorktreeLoad }
     /** Branch, upstream, ahead/behind, uncommitted changes and any stopped merge or rebase. */

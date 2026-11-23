@@ -221,6 +221,16 @@ button {
   font-style: italic;
 }
 
+/* A stash: a hollow node beside the commit it was made on. */
+.graph circle.stash {
+  fill: var(--bg);
+}
+
+.row.stash .subject {
+  color: var(--muted);
+  font-style: italic;
+}
+
 .row.wip .author {
   max-width: none;
 }
@@ -307,6 +317,14 @@ button {
 
 .ref.tag::before {
   content: '#';
+  color: var(--muted);
+}
+
+.ref.stash {
+  border-style: dotted;
+}
+
+.ref.stash .name {
   color: var(--muted);
 }
 

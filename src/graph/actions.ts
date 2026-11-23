@@ -1,7 +1,7 @@
 // Git actions from the panel: context menus for commits and refs, the fetch/pull/push toolbar,
 // the banner for a stopped merge or rebase, and the confirm → run → report flow they share.
 import { buildArgs, changesWorktree, isRefName } from '../actions.ts'
-import type { ActionResult, Commit, GitAction, Operation, Ref, RepoStatus } from '../types.ts'
+import type { ActionResult, Commit, GitAction, Operation, Ref, RepoStatus, Stash } from '../types.ts'
 import { el, icon, ICONS } from './dom.ts'
 import { orca } from './frame.ts'
 import { openDialog, openMenu, toast, type DialogSpec, type MenuEntry, type MenuOptions, type Values } from './overlay.ts'
@@ -26,6 +26,12 @@ export function initActions(panel: ActionHost): void {
 const short = (hash: string) => hash.slice(0, 7)
 const clip = (text: string, max = 48) => (text.length > max ? `${text.slice(0, max - 1)}…` : text)
 const ACTION_TIMEOUT_MS = 130_000
+
+/** The command line an action runs, as the worker builds it; null for an action it would refuse. */
+function commandOf(action: GitAction, remotes: readonly string[]): string | null {
+  const built = buildArgs(action, { remotes })
+  return built.ok ? `git ${built.args.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(' ')}` : null
+}
 
 function setBusy(on: boolean): void {
   busy = on
@@ -83,7 +89,10 @@ function report(note: ReturnType<typeof toast>, action: GitAction, labels: Label
       note.update({
         tone: 'warning',
         title: 'Stopped on conflicts',
-        detail: 'Resolve the conflicted files, then Continue from the banner, or Abort.'
+        // Applying a stash leaves no operation to continue, and git keeps the stash.
+        detail: action.kind.startsWith('stash')
+          ? 'Resolve the conflicted files and stage them. The stash is still there: drop it when you are done.'
+          : 'Resolve the conflicted files, then Continue from the banner, or Abort.'
       })
       return
     default: {
@@ -138,6 +147,11 @@ interface Guard {
   fields?: DialogSpec['fields']
   /** Ask even without warnings (destructive or surprising actions). */
   always?: boolean
+  /**
+   * For actions that move HEAD: with uncommitted changes, offer to stash them first. This is the
+   * stash's message.
+   */
+  offerStash?: string
   /** The action, from the dialog's values. */
   build: (values: Values) => GitAction
   labels: (values: Values) => Labels
@@ -150,26 +164,47 @@ interface Guard {
 async function guarded(guard: Guard): Promise<boolean> {
   const draft = guard.build(defaults(guard.fields))
   const warnings = changesWorktree(draft) ? await worktreeWarnings(draft) : []
-  let values: Values = defaults(guard.fields)
-  if (guard.always || guard.fields?.length || warnings.length > 0) {
-    const remotes = host.status()?.remotes ?? []
+  // worktreeWarnings has just re-read the status.
+  const status = host.status()
+  const dirty = status ? status.staged + status.unstaged + status.untracked : 0
+  const stashFirst: GitAction | null =
+    guard.offerStash && dirty > 0 && !status?.conflicts && !status?.operation
+      ? { kind: 'stashPush', includeUntracked: true, message: guard.offerStash }
+      : null
+  const fields: NonNullable<DialogSpec['fields']> = [
+    ...(guard.fields ?? []),
+    ...(stashFirst
+      ? [{ kind: 'check' as const, id: STASH_FIRST, label: 'Stash the changes first', hint: 'Untracked files too. Bring them back later with Pop on the stash.', value: false }]
+      : [])
+  ]
+  let values: Values = defaults(fields)
+  if (guard.always || fields.length > 0 || warnings.length > 0) {
+    const remotes = status?.remotes ?? []
     const answer = await openDialog({
       title: guard.title,
       text: guard.text,
       warnings,
-      fields: guard.fields,
+      fields,
       confirm: guard.confirm,
       danger: guard.danger,
       preview: (v) => {
-        const built = buildArgs(guard.build(v), { remotes })
-        return built.ok ? `git ${built.args.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(' ')}` : null
+        const command = commandOf(guard.build(v), remotes)
+        const before = stashFirst && v[STASH_FIRST] ? commandOf(stashFirst, remotes) : null
+        return command && before ? `${before} && ${command}` : command
       }
     })
     if (!answer) return false
     values = answer
   }
+  if (stashFirst && values[STASH_FIRST]) {
+    const stashed = await perform(stashFirst, { busy: 'Stashing the changes…', done: 'Stashed the uncommitted changes' })
+    if (!stashed) return false
+  }
   return perform(guard.build(values), guard.labels(values))
 }
+
+/** The dialog field that asks to stash before the action. */
+const STASH_FIRST = 'stash-first'
 
 function defaults(fields: DialogSpec['fields'] = []): Values {
   const values: Values = {}
@@ -187,7 +222,9 @@ async function worktreeWarnings(action: GitAction): Promise<string[]> {
       status.unstaged && `${status.unstaged} modified`,
       status.untracked && `${status.untracked} untracked`
     ].filter(Boolean)
-    if (action.kind === 'reset' && action.mode === 'hard' && changed > 0) {
+    if (action.kind === 'stashPush') {
+      // The changes are what it is about.
+    } else if (action.kind === 'reset' && action.mode === 'hard' && changed > 0) {
       warnings.push(`The worktree has uncommitted changes (${parts.join(', ')}). A hard reset throws them away.`)
     } else if (changed > 0) {
       warnings.push(`The worktree has uncommitted changes (${parts.join(', ')}). Git may refuse, or carry them along.`)
@@ -403,6 +440,7 @@ export function commitMenu(commit: Commit, at: { x: number; y: number }, options
           text: 'HEAD will point at this commit, not at a branch ("detached"). New commits here belong to no branch until you create one.',
           confirm: 'Check out',
           always: true,
+          offerStash: `Before checking out ${short(commit.hash)}`,
           build: () => ({ kind: 'checkoutDetached', hash: commit.hash }),
           labels: () => ({ busy: `Checking out ${short(commit.hash)}…`, done: `Checked out ${short(commit.hash)}` })
         })
@@ -536,6 +574,7 @@ function localBranchEntries(name: string, twins: string[], status: RepoStatus): 
           void guarded({
             title: `Check out ${name}`,
             confirm: 'Check out',
+            offerStash: `Before switching to ${name}`,
             build: () => ({ kind: 'checkout', branch: name }),
             labels: () => ({ busy: `Checking out ${name}…`, done: `Checked out ${name}` })
           })
@@ -641,6 +680,7 @@ function remoteBranchEntries(fullName: string, status: RepoStatus): MenuEntry[] 
           title: `Check out ${fullName}`,
           text: `Creates a local branch that tracks ${fullName}.`,
           confirm: 'Check out',
+          offerStash: `Before switching to ${split.branch}`,
           fields: [{ kind: 'text', id: 'local', label: 'Local branch name', value: split.branch, validate: refNameCheck('branch') }],
           build: (v) => ({ kind: 'checkoutRemote', remoteBranch: fullName, local: String(v.local).trim() }),
           labels: (v) => ({ busy: `Checking out ${fullName}…`, done: `Checked out ${String(v.local).trim()}` })
@@ -707,6 +747,96 @@ function tagEntries(name: string, status: RepoStatus): MenuEntry[] {
     { label: 'Copy name', run: () => void copy(name, 'tag name') }
   )
   return entries
+}
+
+// ---- Stashes ---------------------------------------------------------------------------------
+
+/** Stashes the uncommitted changes, asking for a message and whether untracked files go too. */
+export function stashFlow(): Promise<boolean> {
+  return guarded({
+    title: 'Stash the uncommitted changes',
+    text: 'Sets them aside and leaves the worktree clean. Bring them back with Apply or Pop on the stash.',
+    confirm: 'Stash',
+    fields: [
+      { kind: 'text', id: 'message', label: 'Message (optional)', placeholder: 'What this work is' },
+      { kind: 'check', id: 'untracked', label: 'Include untracked files', value: true }
+    ],
+    build: (v) => ({ kind: 'stashPush', includeUntracked: Boolean(v.untracked), message: String(v.message).trim() || undefined }),
+    labels: () => ({ busy: 'Stashing the changes…', done: 'Stashed the uncommitted changes' })
+  })
+}
+
+/** The menu of the uncommitted-changes row. */
+export function worktreeMenu(at: { x: number; y: number }, options?: MenuOptions): void {
+  const status = host.status()
+  if (!status) return
+  const blocked = stoppedOperation() || (status.conflicts > 0 ? 'Resolve the conflicts first' : false)
+  openMenu([{ heading: 'Uncommitted changes' }, { label: 'Stash changes…', disabled: blocked, run: () => void stashFlow() }], at, options)
+}
+
+export function stashMenu(stash: Stash, at: { x: number; y: number }, options?: MenuOptions): void {
+  if (!host.status()) return
+  const name = `stash@{${stash.index}}`
+  const which = { index: stash.index, hash: stash.hash }
+  const stopped = stoppedOperation()
+  const entries: MenuEntry[] = [
+    { heading: `${name} · ${clip(stash.message, 36)}` },
+    {
+      label: 'Apply',
+      hint: 'keeps the stash',
+      disabled: stopped,
+      run: () =>
+        void guarded({
+          title: `Apply ${name}`,
+          confirm: 'Apply',
+          build: () => ({ kind: 'stashApply', ...which }),
+          labels: () => ({ busy: `Applying ${name}…`, done: `Applied ${name}` })
+        })
+    },
+    {
+      label: 'Pop',
+      hint: 'applies and drops it',
+      disabled: stopped,
+      run: () =>
+        void guarded({
+          title: `Pop ${name}`,
+          confirm: 'Pop',
+          build: () => ({ kind: 'stashPop', ...which }),
+          labels: () => ({ busy: `Popping ${name}…`, done: `Popped ${name}` })
+        })
+    },
+    {
+      label: 'Create branch from stash…',
+      disabled: stopped,
+      run: () =>
+        void guarded({
+          title: `Create a branch from ${name}`,
+          text: 'Creates the branch at the commit the stash was made on, checks it out, applies the stash there and drops it.',
+          confirm: 'Create branch',
+          fields: [{ kind: 'text', id: 'name', label: 'Branch name', placeholder: 'feature/name', validate: refNameCheck('branch') }],
+          build: (v) => ({ kind: 'stashBranch', name: String(v.name).trim(), ...which }),
+          labels: (v) => ({ busy: `Creating ${String(v.name).trim()}…`, done: `Created ${String(v.name).trim()} from ${name}` })
+        })
+    },
+    'separator',
+    {
+      label: 'Drop…',
+      danger: true,
+      run: () =>
+        void guarded({
+          title: `Drop ${name}`,
+          text: `Deletes the stashed changes of "${clip(stash.message, 60)}". They are not applied anywhere.`,
+          confirm: 'Drop',
+          danger: true,
+          always: true,
+          build: () => ({ kind: 'stashDrop', ...which }),
+          labels: () => ({ busy: `Dropping ${name}…`, done: `Dropped ${name}` })
+        })
+    },
+    'separator',
+    { label: 'Copy message', run: () => void copy(stash.message, 'message') }
+  ]
+  openMenu(entries, at, options)
 }
 
 // ---- Toolbar and banner ----------------------------------------------------------------------

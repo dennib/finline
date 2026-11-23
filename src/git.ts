@@ -5,7 +5,7 @@ import { execFile } from 'node:child_process'
 import { access, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { uncPath, WSL_EXE, withWslEnv, wslGitArgs, wslTarget, type WslTarget } from './wsl.ts'
-import type { Commit, CommitDetails, FileChange, FileStatus, Operation, Ref, RepoStatus, WorktreeChanges } from './types'
+import type { Commit, CommitDetails, FileChange, FileStatus, Operation, Ref, RepoStatus, Stash, WorktreeChanges } from './types'
 
 const FIELD = '\x1f'
 const RECORD = '\x1e'
@@ -246,6 +246,58 @@ export async function remoteNames(cwd: string): Promise<string[]> {
   return (await git(cwd, ['remote'])).split(/\r?\n/).filter(Boolean)
 }
 
+const STASH_FORMAT = ['%H', '%P', '%ct', '%gs'].join('%x1f') + '%x1e'
+
+/** Parses `git log -g --format=STASH_FORMAT refs/stash`: one record per stash, newest first. */
+export function parseStashList(out: string): Stash[] {
+  return out
+    .split(RECORD)
+    .map((record) => record.replace(/^\r?\n/, ''))
+    .filter((record) => record.length > 0)
+    .map((record, index) => {
+      const [hash, parents, at, ...rest] = record.split(FIELD)
+      // A stash is a merge of the commit it was made on, the index then, and (with -u) the
+      // untracked files.
+      const [base, , untracked] = parents ? parents.split(' ') : []
+      const subject = rest.join(FIELD)
+      const named = /^On ([^:]+): (.*)$/.exec(subject)
+      const wip = /^WIP on ([^:]+):/.exec(subject)
+      return {
+        index,
+        hash,
+        base: base ?? null,
+        untracked: untracked ?? null,
+        message: named ? named[2] : wip ? `WIP on ${wip[1]}` : subject,
+        branch: named?.[1] ?? wip?.[1] ?? null,
+        createdAt: Number(at) * 1000
+      }
+    })
+}
+
+/** Every stash, newest first; none when the repository has no stash. */
+export async function readStashes(cwd: string, max: number, signal?: AbortSignal): Promise<Stash[]> {
+  try {
+    return parseStashList(await git(cwd, ['log', '-g', `--max-count=${max}`, `--format=${STASH_FORMAT}`, 'refs/stash', '--'], signal))
+  } catch {
+    return [] // no refs/stash
+  }
+}
+
+/** The files of a stash's untracked-files commit (a root commit holding only them). */
+export async function readUntrackedOfStash(cwd: string, hash: string, signal?: AbortSignal): Promise<FileChange[]> {
+  const diff = await git(cwd, ['diff-tree', '-r', '-z', '--raw', '--numstat', '--no-commit-id', '--root', `${hash}^{commit}`], signal)
+  return parseDiffTree(diff).map((file) => ({ ...file, untracked: true }))
+}
+
+/** The commit `stash@{index}` names now, or null when there is no such stash. */
+export async function stashAt(cwd: string, index: number, signal?: AbortSignal): Promise<string | null> {
+  try {
+    return (await git(cwd, ['rev-parse', '--verify', '--quiet', `stash@{${index}}`], signal)).trim() || null
+  } catch {
+    return null
+  }
+}
+
 /** Splits a `%D` decoration list into typed refs. */
 export function parseRefs(decorations: string, remotes: readonly string[]): Ref[] {
   if (!decorations) return []
@@ -269,7 +321,9 @@ export async function readCommits(
   try {
     out = await git(
       cwd,
-      ['log', '--all', '--topo-order', `--skip=${opts.skip}`, `--max-count=${opts.limit}`, `--format=${FORMAT}`],
+      // Stashes are listed apart (readStashes): from `--all` only the newest would show, as a
+      // merge with its helper commits.
+      ['log', '--exclude=refs/stash', '--all', '--topo-order', `--skip=${opts.skip}`, `--max-count=${opts.limit}`, `--format=${FORMAT}`],
       signal
     )
   } catch (error) {

@@ -1,6 +1,6 @@
 // Data shapes shared by the worker and the panel.
 
-export type RefKind = 'head' | 'branch' | 'remote' | 'tag' | 'detached'
+export type RefKind = 'head' | 'branch' | 'remote' | 'tag' | 'detached' | 'stash'
 
 export interface Ref {
   /** Display name: "main", "origin/main", "v1.0"; "HEAD" when detached. */
@@ -30,8 +30,26 @@ export interface FileChange {
   /** Line counts; null for binary files. */
   added: number | null
   deleted: number | null
-  /** Not tracked by git yet (uncommitted changes only). */
+  /** Not tracked by git yet (uncommitted changes, or a stash's untracked files). */
   untracked?: boolean
+}
+
+/** One entry of `git stash list`. */
+export interface Stash {
+  /** Position in the list: `stash@{index}`. It shifts when a stash is added or dropped. */
+  index: number
+  /** The stash's commit; it stays the same while the index shifts. */
+  hash: string
+  /** The commit the changes were stashed on; null when unknown. */
+  base: string | null
+  /** The commit that holds the stash's untracked files, when it has any. */
+  untracked: string | null
+  /** The message given, or "WIP on <branch>". */
+  message: string
+  /** The branch it was made on, as git recorded it. */
+  branch: string | null
+  /** ms since the epoch */
+  createdAt: number
 }
 
 export interface CommitDetails {
@@ -100,6 +118,13 @@ export type GitAction =
   | { kind: 'deleteBranch'; name: string; force: boolean }
   | { kind: 'createTag'; name: string; at: string; message?: string }
   | { kind: 'deleteTag'; name: string }
+  // Stashes: `index` says which, `hash` lets the worker check it still is that one.
+  | { kind: 'stashPush'; message?: string; includeUntracked: boolean }
+  | { kind: 'stashApply'; index: number; hash: string }
+  | { kind: 'stashPop'; index: number; hash: string }
+  | { kind: 'stashDrop'; index: number; hash: string }
+  /** A new branch at the stash's base commit, checked out, with the stash applied and dropped. */
+  | { kind: 'stashBranch'; name: string; index: number; hash: string }
   // Remotes
   | { kind: 'fetch' }
   | { kind: 'pull'; mode: 'ff-only' | 'rebase' | 'merge' }
@@ -148,6 +173,8 @@ export type GraphLoad =
       repo: RepoInfo
       /** Commits `skip` .. `skip + commits.length` of `git log --all --topo-order`. */
       commits: Commit[]
+      /** Every stash, newest first; they are not among `commits`. */
+      stashes: Stash[]
       skip: number
       hasMore: boolean
       /** How the repo path was found, for diagnostics. */

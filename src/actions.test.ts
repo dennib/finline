@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { AUTH_FAILURE, buildArgs, changesWorktree, CONFLICT, isRefName } from './actions.ts'
+import { AUTH_FAILURE, buildArgs, changesWorktree, CONFLICT, isRefName, stashTarget } from './actions.ts'
 import type { GitAction } from './types.ts'
 
 const ctx = { remotes: ['origin', 'upstream'] }
@@ -86,4 +86,32 @@ test('git failure messages are classified', () => {
   assert.match('CONFLICT (content): Merge conflict in a.txt', CONFLICT)
   assert.match('error: could not apply abc1234... msg', CONFLICT)
   assert.doesNotMatch('error: failed to push some refs (non-fast-forward)', AUTH_FAILURE)
+})
+
+test('stash actions name the stash by index and refuse anything else', () => {
+  const remotes = ['origin']
+  const run = (action: GitAction) => buildArgs(action, { remotes })
+  const hash = 'abc1234'
+  assert.deepEqual(run({ kind: 'stashPush', includeUntracked: false }), { ok: true, args: ['stash', 'push'] })
+  assert.deepEqual(run({ kind: 'stashPush', includeUntracked: true, message: '  half done ' }), {
+    ok: true,
+    args: ['stash', 'push', '--include-untracked', '-m', 'half done']
+  })
+  assert.deepEqual(run({ kind: 'stashApply', index: 0, hash }), { ok: true, args: ['stash', 'apply', 'stash@{0}'] })
+  assert.deepEqual(run({ kind: 'stashPop', index: 2, hash }), { ok: true, args: ['stash', 'pop', 'stash@{2}'] })
+  assert.deepEqual(run({ kind: 'stashDrop', index: 1, hash }), { ok: true, args: ['stash', 'drop', 'stash@{1}'] })
+  assert.deepEqual(run({ kind: 'stashBranch', name: 'fix/a', index: 0, hash }), {
+    ok: true,
+    args: ['stash', 'branch', 'fix/a', 'stash@{0}']
+  })
+  assert.equal(run({ kind: 'stashPush', includeUntracked: false, message: 'two\nlines' }).ok, false)
+  assert.equal(run({ kind: 'stashDrop', index: -1, hash }).ok, false)
+  assert.equal(run({ kind: 'stashDrop', index: 1.5, hash }).ok, false)
+  assert.equal(run({ kind: 'stashPop', index: '0} --all' as unknown as number, hash }).ok, false)
+  assert.equal(run({ kind: 'stashApply', index: 0, hash: 'stash' }).ok, false)
+  assert.equal(run({ kind: 'stashBranch', name: '-D', index: 0, hash }).ok, false)
+  assert.deepEqual(stashTarget({ kind: 'stashPop', index: 2, hash }), { index: 2, hash })
+  assert.equal(stashTarget({ kind: 'stashPush', includeUntracked: true }), null)
+  assert.ok(changesWorktree({ kind: 'stashPop', index: 0, hash }))
+  assert.ok(!changesWorktree({ kind: 'stashDrop', index: 0, hash }))
 })
