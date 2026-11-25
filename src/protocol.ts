@@ -1,5 +1,5 @@
 // Panel <-> worker contract, shared by the panel and src/worker.ts.
-import type { ActionResult, Candidate, DetailsLoad, GitAction, GraphLoad, StatusLoad, WorktreeLoad } from './types'
+import type { ActionResult, Candidate, DetailsLoad, GitAction, GraphLoad, RefsLoad, StatusLoad, WorktreeLoad } from './types'
 
 declare module 'orca' {
   interface PluginRequests {
@@ -20,6 +20,8 @@ declare module 'orca' {
     'worktree.changes': { input: { path: string }; output: WorktreeLoad }
     /** Branch, upstream, ahead/behind, uncommitted changes and any stopped merge or rebase. */
     'repo.status': { input: { path: string }; output: StatusLoad }
+    /** Local branches (with the worktree that holds each) and tags, for the branch switcher. */
+    'refs.list': { input: { path: string }; output: RefsLoad }
     /** Runs one git action in the background, without prompts. */
     'git.run': { input: { path: string; action: GitAction }; output: ActionResult }
     /** Runs a remote action in a new Orca terminal of the workspace, where git can ask for credentials. */

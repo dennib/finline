@@ -102,6 +102,23 @@ export interface RepoStatus {
   remotes: string[]
 }
 
+/** A local branch, for the branch switcher. */
+export interface BranchInfo {
+  name: string
+  /** Path of the worktree that has it checked out, this one included; null when none has. */
+  worktree: string | null
+}
+
+/** Local branches and tags, newest first. */
+export interface RefList {
+  branches: BranchInfo[]
+  tags: string[]
+  /** More tags exist than were sent. */
+  tagsTruncated: boolean
+}
+
+export type RefsLoad = { ok: true; refs: RefList } | { ok: false; message: string }
+
 export type StatusLoad = { ok: true; status: RepoStatus } | { ok: false; message: string }
 
 /**
@@ -113,6 +130,8 @@ export type GitAction =
   | { kind: 'checkout'; branch: string }
   | { kind: 'checkoutRemote'; remoteBranch: string; local: string }
   | { kind: 'checkoutDetached'; hash: string }
+  /** HEAD at a tag's commit, detached. */
+  | { kind: 'checkoutTag'; name: string }
   | { kind: 'createBranch'; name: string; at: string; checkout: boolean }
   | { kind: 'renameBranch'; from: string; to: string }
   | { kind: 'deleteBranch'; name: string; force: boolean }

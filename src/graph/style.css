@@ -98,21 +98,66 @@ body {
   white-space: nowrap;
 }
 
-.branch {
-  flex: none;
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: var(--orca-secondary, #2a2a2a);
-  color: var(--orca-secondary-foreground, var(--fg));
-  white-space: nowrap;
-  max-width: 45%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 button {
   font: inherit;
   color: inherit;
+}
+
+/* The current branch, and the dropdown that switches to another branch or tag. */
+.branch {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  max-width: 45%;
+  height: 20px;
+  padding: 0 4px 0 8px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--orca-secondary, #2a2a2a);
+  color: var(--orca-secondary-foreground, var(--fg));
+  cursor: pointer;
+  transition: background-color 120ms ease-out;
+}
+
+.branch:hover,
+.branch[aria-expanded='true'] {
+  background: color-mix(in srgb, var(--fg) 12%, var(--orca-secondary, #2a2a2a));
+}
+
+.branch:focus-visible {
+  outline: 2px solid var(--orca-primary, #3b82f6);
+  outline-offset: 1px;
+}
+
+.branch-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branch.detached .branch-name {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.branch svg {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.7;
+  transition: transform 140ms ease-out;
+}
+
+.branch[aria-expanded='true'] svg {
+  transform: rotate(180deg);
 }
 
 .icon {
@@ -1026,6 +1071,77 @@ button.tree-row:hover .name {
   height: 1px;
   margin: 4px 6px;
   background: var(--surface-line);
+}
+
+/* A dropdown longer than the panel scrolls; with a filter, only the list under the field does. */
+.menu {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.menu.filtered {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.menu-filter {
+  flex: none;
+  width: 100%;
+  margin-bottom: 4px;
+}
+
+.menu-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.menu-empty {
+  padding: 6px 8px;
+  color: var(--muted);
+}
+
+.menu-check {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: var(--orca-primary, #3b82f6);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Tooltip */
+
+.tip {
+  position: fixed;
+  z-index: 40;
+  max-width: min(280px, calc(100vw - 8px));
+  padding: 5px 8px;
+  border: 1px solid var(--surface-line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 0.3);
+  pointer-events: none;
+  animation: tip-in 100ms ease-out;
+}
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.tip-command {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
 }
 
 /* Dialog */

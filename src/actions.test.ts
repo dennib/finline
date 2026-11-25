@@ -29,6 +29,7 @@ test('branch and tag actions', () => {
     'switch', '-c', 'feat/x', '--track', 'origin/feat/x'
   ])
   assert.deepEqual(args({ kind: 'checkoutDetached', hash: 'abc1234' }), ['switch', '--detach', 'abc1234'])
+  assert.deepEqual(args({ kind: 'checkoutTag', name: 'v1.2.0' }), ['switch', '--detach', 'refs/tags/v1.2.0'])
   assert.deepEqual(args({ kind: 'createBranch', name: 'fix/a', at: 'abc1234', checkout: false }), ['branch', 'fix/a', 'abc1234'])
   assert.deepEqual(args({ kind: 'createBranch', name: 'fix/a', at: 'abc1234', checkout: true }), [
     'switch', '-c', 'fix/a', 'abc1234'
@@ -39,6 +40,7 @@ test('branch and tag actions', () => {
     'tag', '-a', 'v1', '-m', 'Release 1', 'abc1234'
   ])
   refused({ kind: 'checkout', branch: '--orphan' })
+  refused({ kind: 'checkoutTag', name: '--force' })
   refused({ kind: 'createBranch', name: 'ok', at: 'HEAD~1', checkout: false }) // only hashes from the panel
 })
 

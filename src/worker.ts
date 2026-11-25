@@ -14,6 +14,7 @@ import {
   gitVersion,
   readCommitDetails,
   readCommits,
+  readRefList,
   readStashes,
   readStatus,
   readUntrackedOfStash,
@@ -25,7 +26,7 @@ import {
 } from './git'
 import { getSshTargetMap, resolveRemoteWorkspace, selectRemoteWorkspace } from './remote'
 import { wslFingerprint, wslLookupError, wslTarget, type WslTarget } from './wsl.ts'
-import type { ActionResult, Candidate, DetailsLoad, GraphLoad, StatusLoad, WorktreeLoad } from './types'
+import type { ActionResult, Candidate, DetailsLoad, GraphLoad, RefsLoad, StatusLoad, WorktreeLoad } from './types'
 
 const DEFAULT_LIMIT = 200
 // About 250 bytes of JSON per commit keeps a full page well under the 1 MiB answer cap.
@@ -37,6 +38,8 @@ const WORKTREE_DEBOUNCE_MS = 500
 const WORKTREE_MAX_WAIT_MS = 3000
 // About 100 bytes of JSON per file; a huge commit lists the first ones and says it was cut.
 const MAX_FILES = 2000
+// The branch switcher filters by name; past this many tags it says the list was cut.
+const MAX_TAGS = 500
 const MAX_STASHES = 100
 const HASH = /^[0-9a-f]{4,64}$/i
 // Paths under the git dir whose change means the graph may have changed.
@@ -354,6 +357,15 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (!served.has(path)) return { ok: false, message: 'Unknown repository; reload the graph.' }
     try {
       return { ok: true, status: await readStatus(path, signal) }
+    } catch (error) {
+      return { ok: false, message: (error as Error).message }
+    }
+  })
+
+  orca.panels.handle('refs.list', async ({ path }, { signal }): Promise<RefsLoad> => {
+    if (!served.has(path)) return { ok: false, message: 'Unknown repository; reload the graph.' }
+    try {
+      return { ok: true, refs: await readRefList(path, MAX_TAGS, signal) }
     } catch (error) {
       return { ok: false, message: (error as Error).message }
     }

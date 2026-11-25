@@ -5,7 +5,7 @@ import { el, icon, ICONS, moving } from './dom.ts'
 // ---- Context menu ----------------------------------------------------------------------------
 
 export type MenuEntry =
-  | { label: string; hint?: string; danger?: boolean; disabled?: boolean | string; run: () => void }
+  | { label: string; hint?: string; danger?: boolean; disabled?: boolean | string; /** Marked as the current choice. */ checked?: boolean; run: () => void }
   | { heading: string }
   | 'separator'
 
@@ -16,31 +16,64 @@ export interface MenuOptions {
   returnFocus?: HTMLElement
   /** Called once when the menu closes, chosen or dismissed. */
   onClose?: () => void
+  /** A dropdown: stays under the point and scrolls in the room left, instead of flipping above. */
+  below?: boolean
+  /** Adds a field that filters the items by label as the person types; this is its placeholder. */
+  filter?: string
 }
 
 /** Opens a menu at a point (clamped to the panel) and focuses its first item. */
-export function openMenu(entries: MenuEntry[], at: { x: number; y: number }, { returnFocus, onClose }: MenuOptions = {}): void {
+export function openMenu(entries: MenuEntry[], at: { x: number; y: number }, { returnFocus, onClose, below, filter }: MenuOptions = {}): void {
   closeOpenMenu?.()
+  hideTip()
   const menu = el('div', 'menu')
   menu.setAttribute('role', 'menu')
+  // With a filter the field stays put and the items scroll under it.
+  const search = filter === undefined ? null : el('input', 'input menu-filter')
+  const list = search ? el('div', 'menu-list') : menu
+  const empty = el('div', 'menu-empty', 'No match')
+  if (search) {
+    search.type = 'text'
+    search.placeholder = filter!
+    search.spellcheck = false
+    search.autocomplete = 'off'
+    search.setAttribute('aria-label', filter!)
+    empty.hidden = true
+    list.append(empty)
+    menu.classList.add('filtered')
+    menu.append(search, list)
+  }
   const items: HTMLButtonElement[] = []
+  /** Headings and separators with the items under them, for the filter. */
+  const sections: { head: HTMLElement[]; items: { node: HTMLButtonElement; label: string }[] }[] = [{ head: [], items: [] }]
   let lastWasSeparator = true
   for (const entry of entries) {
     if (entry === 'separator') {
-      if (!lastWasSeparator) menu.append(el('div', 'menu-separator'))
+      if (!lastWasSeparator) {
+        const line = el('div', 'menu-separator')
+        list.append(line)
+        sections.push({ head: [line], items: [] })
+      }
       lastWasSeparator = true
       continue
     }
     lastWasSeparator = false
     if ('heading' in entry) {
-      menu.append(el('div', 'menu-heading', entry.heading))
+      const heading = el('div', 'menu-heading', entry.heading)
+      list.append(heading)
+      const section = sections[sections.length - 1]
+      if (section.items.length === 0) section.head.push(heading)
+      else sections.push({ head: [heading], items: [] })
       continue
     }
     const item = el('button', entry.danger ? 'menu-item danger' : 'menu-item')
     item.type = 'button'
-    item.setAttribute('role', 'menuitem')
+    item.setAttribute('role', entry.checked === undefined ? 'menuitem' : 'menuitemradio')
+    if (entry.checked !== undefined) item.setAttribute('aria-checked', String(entry.checked))
     item.append(el('span', 'menu-label', entry.label))
     if (entry.hint) item.append(el('span', 'menu-hint', entry.hint))
+    if (entry.checked) item.append(icon(ICONS.check, 'menu-check'))
+    sections[sections.length - 1].items.push({ node: item, label: entry.label.toLowerCase() })
     if (entry.disabled) {
       item.disabled = true
       if (typeof entry.disabled === 'string') item.title = entry.disabled
@@ -50,24 +83,45 @@ export function openMenu(entries: MenuEntry[], at: { x: number; y: number }, { r
       entry.run()
     })
     items.push(item)
-    menu.append(item)
+    list.append(item)
   }
-  if (menu.lastElementChild?.classList.contains('menu-separator')) menu.lastElementChild.remove()
+  if (list.lastElementChild?.classList.contains('menu-separator')) list.lastElementChild.remove()
 
   document.body.append(menu)
   const { innerWidth: w, innerHeight: h } = window
+  if (below) menu.style.maxHeight = `${Math.max(120, h - at.y - 6)}px`
   const box = menu.getBoundingClientRect()
   const left = Math.max(4, Math.min(at.x, w - box.width - 4))
-  const top = at.y + box.height + 4 > h ? Math.max(4, at.y - box.height) : at.y
+  const top = below ? Math.min(at.y, Math.max(4, h - box.height - 6)) : at.y + box.height + 4 > h ? Math.max(4, at.y - box.height) : at.y
   menu.style.left = `${left}px`
   menu.style.top = `${top}px`
   menu.style.transformOrigin = `${at.x - left}px ${at.y - top}px`
+  // Filtering must not make the menu jump narrower.
+  if (search) menu.style.width = `${box.width}px`
 
-  const enabled = () => items.filter((i) => !i.disabled)
-  enabled()[0]?.focus({ preventScroll: true })
+  const enabled = () => items.filter((i) => !i.disabled && !i.hidden)
+  if (search) search.focus({ preventScroll: true })
+  else enabled()[0]?.focus({ preventScroll: true })
+
+  search?.addEventListener('input', () => {
+    const query = search.value.trim().toLowerCase()
+    let any = false
+    for (const section of sections) {
+      let shown = false
+      for (const { node, label } of section.items) {
+        node.hidden = !label.includes(query)
+        shown ||= !node.hidden
+      }
+      for (const node of section.head) node.hidden = !shown
+      any ||= shown
+    }
+    empty.hidden = any
+    list.scrollTop = 0
+  })
 
   const onKey = (event: KeyboardEvent) => {
     const list = enabled()
+    const inSearch = document.activeElement === search
     const index = list.indexOf(document.activeElement as HTMLButtonElement)
     if (event.key === 'Escape' || event.key === 'Tab') {
       event.preventDefault()
@@ -75,16 +129,31 @@ export function openMenu(entries: MenuEntry[], at: { x: number; y: number }, { r
     } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault()
       const step = event.key === 'ArrowDown' ? 1 : -1
-      list[(index + step + list.length) % list.length]?.focus()
+      const next = index < 0 ? (step > 0 ? 0 : list.length - 1) : index + step
+      // Past either end, back to the filter field.
+      if (search && !inSearch && (next < 0 || next >= list.length)) search.focus()
+      else list[(next + list.length) % list.length]?.focus()
+    } else if (inSearch) {
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        list[0]?.click()
+      }
     } else if (event.key === 'Home' || event.key === 'End') {
       event.preventDefault()
       list[event.key === 'Home' ? 0 : list.length - 1]?.focus()
+    } else if (search && (event.key.length === 1 || event.key === 'Backspace') && !event.metaKey && !event.ctrlKey && !event.altKey && event.key !== ' ') {
+      // Typing anywhere in the menu goes on filtering.
+      search.focus()
     }
   }
   const onPointer = (event: PointerEvent) => {
     if (!menu.contains(event.target as Node)) close()
   }
   const onAway = () => close()
+  // The menu's own list scrolls; anything else scrolling moves what the menu belongs to.
+  const onScroll = (event: Event) => {
+    if (!menu.contains(event.target as Node)) close()
+  }
 
   function close(): void {
     if (closeOpenMenu !== close) return
@@ -93,7 +162,7 @@ export function openMenu(entries: MenuEntry[], at: { x: number; y: number }, { r
     document.removeEventListener('pointerdown', onPointer, true)
     window.removeEventListener('blur', onAway)
     window.removeEventListener('resize', onAway)
-    document.removeEventListener('scroll', onAway, true)
+    document.removeEventListener('scroll', onScroll, true)
     const done = () => menu.remove()
     if (moving()) menu.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 90 }).onfinish = done
     else done()
@@ -105,7 +174,7 @@ export function openMenu(entries: MenuEntry[], at: { x: number; y: number }, { r
   document.addEventListener('pointerdown', onPointer, true)
   window.addEventListener('blur', onAway)
   window.addEventListener('resize', onAway)
-  document.addEventListener('scroll', onAway, true)
+  document.addEventListener('scroll', onScroll, true)
 }
 
 // ---- Dialog ----------------------------------------------------------------------------------
@@ -133,6 +202,7 @@ export interface DialogSpec {
 /** Resolves with the field values on confirm, or null when cancelled. */
 export function openDialog(spec: DialogSpec): Promise<Values | null> {
   closeOpenMenu?.()
+  hideTip()
   const returnFocus = document.activeElement as HTMLElement | null
   return new Promise((resolve) => {
     const backdrop = el('div', 'dialog-backdrop')
@@ -384,4 +454,69 @@ export function toast(spec: ToastSpec): Toast {
 
   update(spec)
   return { update, close }
+}
+
+// ---- Tooltips --------------------------------------------------------------------------------
+
+export interface TipSpec {
+  label: string
+  /** The git command the control runs, shown in monospace under the label. */
+  command?: string
+}
+
+const TIP_DELAY_MS = 350
+let tip: HTMLElement | null = null
+let tipTimer: ReturnType<typeof setTimeout> | null = null
+let tipTarget: HTMLElement | null = null
+
+function hideTip(): void {
+  if (tipTimer) clearTimeout(tipTimer)
+  tipTimer = null
+  tipTarget = null
+  tip?.remove()
+  tip = null
+}
+
+function showTip(target: HTMLElement, spec: TipSpec): void {
+  hideTip()
+  if (!target.isConnected) return
+  tipTarget = target
+  tip = el('div', 'tip')
+  tip.setAttribute('role', 'tooltip')
+  tip.append(el('div', 'tip-label', spec.label))
+  if (spec.command) tip.append(el('code', 'tip-command', spec.command))
+  document.body.append(tip)
+  const anchor = target.getBoundingClientRect()
+  const box = tip.getBoundingClientRect()
+  const left = Math.max(4, Math.min(anchor.left + anchor.width / 2 - box.width / 2, window.innerWidth - box.width - 4))
+  const under = anchor.bottom + 6
+  tip.style.left = `${left}px`
+  tip.style.top = `${under + box.height + 4 > window.innerHeight ? Math.max(4, anchor.top - box.height - 6) : under}px`
+}
+
+/**
+ * A tooltip for a control: after a short hover, or at once on keyboard focus. `content` is read
+ * each time it opens, so it follows the control's state. Native `title` tooltips are slow and
+ * cannot show a command.
+ */
+export function tooltip(target: HTMLElement, content: () => TipSpec | null): void {
+  const open = () => {
+    const spec = content()
+    if (spec) showTip(target, spec)
+  }
+  target.addEventListener('pointerenter', () => {
+    if (tipTimer) clearTimeout(tipTimer)
+    tipTimer = setTimeout(open, TIP_DELAY_MS)
+  })
+  target.addEventListener('pointerleave', hideTip)
+  target.addEventListener('pointerdown', hideTip)
+  target.addEventListener('focus', () => {
+    if (target.matches(':focus-visible')) open()
+  })
+  target.addEventListener('blur', () => {
+    if (tipTarget === target) hideTip()
+  })
+  target.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' || event.key === 'Enter' || event.key === ' ') hideTip()
+  })
 }

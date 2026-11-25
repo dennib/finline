@@ -48,6 +48,7 @@ export function changesWorktree(action: GitAction): boolean {
     case 'checkout':
     case 'checkoutRemote':
     case 'checkoutDetached':
+    case 'checkoutTag':
     case 'stashPush':
     case 'stashApply':
     case 'stashPop':
@@ -107,6 +108,11 @@ export function buildArgs(action: GitAction, ctx: BuildContext): Built {
     case 'checkoutDetached': {
       const error = hash(action.hash)
       return error ? bad(error) : ok('switch', '--detach', action.hash)
+    }
+    case 'checkoutTag': {
+      // The full ref name, so a branch of the same name is never what gets checked out.
+      const error = ref(action.name, 'tag')
+      return error ? bad(error) : ok('switch', '--detach', `refs/tags/${action.name}`)
     }
     case 'createBranch': {
       const error = check(ref(action.name, 'branch'), hash(action.at))

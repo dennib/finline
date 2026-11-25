@@ -14,8 +14,13 @@
           <path d="M4.5 6.5L8 10l3.5-3.5" />
         </svg>
       </button>
-      <span class="branch" id="branch" hidden></span>
-      <button class="icon" id="refresh" type="button" title="Refresh" aria-label="Refresh">
+      <button class="branch" id="branch" type="button" aria-haspopup="menu" aria-expanded="false" hidden>
+        <span class="branch-name" id="branch-name"></span>
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M4.5 6.5L8 10l3.5-3.5" />
+        </svg>
+      </button>
+      <button class="icon" id="refresh" type="button" aria-label="Refresh">
         <svg viewBox="0 0 16 16" aria-hidden="true">
           <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" />
         </svg>
